@@ -286,4 +286,813 @@ object UniversalPlaylistParser {
         val result = ArrayList<RadioChannel>()
         val lines = content.split('\n')
         var pendingTitle: String? = null
-        var seq
+        var seq = 1
+
+        for (rawLine in lines) {
+            val line = stripBom(rawLine).trim()
+            if (line.isEmpty()) continue
+
+            if (line.startsWith("#EXTINF", ignoreCase = true)) {
+                pendingTitle = extractExtinfTitle(line)
+                continue
+            }
+
+            if (line.startsWith("#")) {
+                continue
+            }
+
+            val urlMatcher = STREAM_URL_START.matcher(line)
+            if (urlMatcher.find()) {
+                val url = extractCleanUrl(line.substring(urlMatcher.start()))
+                if (url.isNotEmpty()) {
+                    val name = pendingTitle?.takeIf { it.isNotBlank() } ?: "قناة $seq"
+                    result.add(RadioChannel(name = name, url = url))
+                    seq++
+                    pendingTitle = null
+                }
+            }
+        }
+        return result
+    }
+
+    private fun extractExtinfTitle(extinfLine: String): String? {
+        // Find the first comma outside double quotes (separates duration/attributes from channel title)
+        var inQuotes = false
+        var commaIndex = -1
+        for (i in extinfLine.indices) {
+            val ch = extinfLine[i]
+            if (ch == '"') {
+                inQuotes = !inQuotes
+            } else if (ch == ',' && !inQuotes) {
+                commaIndex = i
+                break
+            }
+        }
+
+        if (commaIndex >= 0 && commaIndex + 1 < extinfLine.length) {
+            val titleAfterComma = extinfLine.substring(commaIndex + 1).trim()
+            if (titleAfterComma.isNotEmpty()) {
+                return titleAfterComma
+            }
+        }
+
+        val tvgMatcher = TVG_NAME_REGEX.matcher(extinfLine)
+        if (tvgMatcher.find()) {
+            val tvgName = tvgMatcher.group(1)?.trim()
+            if (!tvgName.isNullOrEmpty()) return tvgName
+        }
+
+        return null
+    }
+
+    private fun parseJson(content: String): List<RadioChannel> {
+        val result = ArrayList<RadioChannel>()
+        try {
+            val trimmed = content.trim()
+            val array = if (trimmed.startsWith("[")) {
+                JSONArray(trimmed)
+            } else {
+                findChannelsJsonArray(JSONObject(trimmed))
+            } ?: return emptyList()
+
+            var seq = 1
+            for (i in 0 until array.length()) {
+                val item = array.opt(i) ?: continue
+                when (item) {
+                    is JSONObject -> {
+                        val rawUrl = findFirstStringByKeys(item, JSON_URL_KEYS)
+                        val url = rawUrl?.let { extractUrlFromField(it) }
+                        if (!url.isNullOrEmpty()) {
+                            val name = findFirstStringByKeys(item, JSON_NAME_KEYS)
+                                ?.takeIf { it.isNotBlank() }
+                                ?: "قناة $seq"
+                            result.add(RadioChannel(name = name, url = url))
+                            seq++
+                        }
+                    }
+
+                    is String -> {
+                        val url = extractUrlFromField(item)
+                        if (!url.isNullOrEmpty()) {
+                            result.add(RadioChannel(name = "قناة $seq", url = url))
+                            seq++
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            return emptyList()
+        }
+        return result
+    }
+
+    private fun findChannelsJsonArray(root: JSONObject): JSONArray? {
+        for (key in JSON_ARRAY_KEYS) {
+            val direct = root.optJSONArray(key)
+            if (direct != null) return direct
+        }
+        // Check case-insensitive keys
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val arr = root.optJSONArray(k)
+            if (arr != null && arr.length() > 0) {
+                return arr
+            }
+        }
+        // Check one level deeper (e.g. {"data": {"channels": [...]}})
+        val nestedKeys = root.keys()
+        while (nestedKeys.hasNext()) {
+            val k = nestedKeys.next()
+            val childObj = root.optJSONObject(k)
+            if (childObj != null) {
+                val found = findChannelsJsonArray(childObj)
+                if (found != null) return found
+            }
+        }
+        return null
+    }
+
+    private fun findFirstStringByKeys(obj: JSONObject, candidateKeys: List<String>): String? {
+        for (key in candidateKeys) {
+            if (obj.has(key) && !obj.isNull(key)) {
+                val value = obj.optString(key, "").trim()
+                if (value.isNotEmpty()) return value
+            }
+        }
+        // Case-insensitive fallback
+        val lowerSet = candidateKeys.map { it.lowercase(Locale.US) }.toSet()
+        val iter = obj.keys()
+        while (iter.hasNext()) {
+            val k = iter.next()
+            if (k.lowercase(Locale.US) in lowerSet && !obj.isNull(k)) {
+                val value = obj.optString(k, "").trim()
+                if (value.isNotEmpty()) return value
+            }
+        }
+        return null
+    }
+
+    private fun parseXml(content: String): List<RadioChannel> {
+        val result = ArrayList<RadioChannel>()
+        try {
+            // Escape raw '&' frequently found inside IPTV/receiver XML stream URLs
+            val sanitized = BARE_AMPERSAND.matcher(content).replaceAll("&amp;")
+            val factory = XmlPullParserFactory.newInstance()
+            factory.isNamespaceAware = false
+            val parser = factory.newPullParser()
+            parser.setInput(StringReader(sanitized))
+
+            var inContainer = false
+            var containerTagName = ""
+            var currentName: String? = null
+            var currentUrl: String? = null
+            var activeChildTag: String? = null
+            var seq = 1
+
+            var eventType = parser.eventType
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                when (eventType) {
+                    XmlPullParser.START_TAG -> {
+                        val tag = parser.name?.lowercase(Locale.US) ?: ""
+                        if (!inContainer && tag in XML_CONTAINER_TAGS) {
+                            inContainer = true
+                            containerTagName = tag
+                            currentName = getXmlAttribute(
+                                parser,
+                                listOf("name", "title", "label", "channel", "station")
+                            )
+                            currentUrl = getXmlAttribute(
+                                parser,
+                                listOf("url", "src", "link", "href", "stream", "uri")
+                            )
+                            activeChildTag = null
+                        } else if (inContainer) {
+                            activeChildTag = tag
+                            if (currentName.isNullOrBlank()) {
+                                currentName = getXmlAttribute(parser, listOf("name", "title", "label"))
+                            }
+                            if (currentUrl.isNullOrBlank()) {
+                                currentUrl = getXmlAttribute(parser, listOf("url", "src", "link", "href"))
+                            }
+                        }
+                    }
+
+                    XmlPullParser.TEXT, XmlPullParser.CDSECT -> {
+                        if (inContainer) {
+                            val text = parser.text?.trim() ?: ""
+                            if (text.isNotEmpty()) {
+                                val child = activeChildTag
+                                if (child != null && child in XML_NAME_TAGS && currentName.isNullOrBlank()) {
+                                    currentName = text
+                                } else if (child != null && child in XML_URL_TAGS && currentUrl.isNullOrBlank()) {
+                                    currentUrl = text
+                                } else if (child == null && currentUrl.isNullOrBlank() &&
+                                    STREAM_URL_START.matcher(text).find()
+                                ) {
+                                    currentUrl = text
+                                }
+                            }
+                        }
+                    }
+
+                    XmlPullParser.END_TAG -> {
+                        val tag = parser.name?.lowercase(Locale.US) ?: ""
+                        if (inContainer && tag == containerTagName) {
+                            val validUrl = currentUrl?.let { extractUrlFromField(it) }
+                            if (!validUrl.isNullOrEmpty()) {
+                                val name = currentName?.takeIf { it.isNotBlank() } ?: "قناة $seq"
+                                result.add(RadioChannel(name = name, url = validUrl))
+                                seq++
+                            }
+                            inContainer = false
+                            containerTagName = ""
+                            currentName = null
+                            currentUrl = null
+                            activeChildTag = null
+                        } else if (inContainer && tag == activeChildTag) {
+                            activeChildTag = null
+                        }
+                    }
+                }
+                eventType = parser.next()
+            }
+        } catch (_: Throwable) {
+            return emptyList()
+        }
+        return result
+    }
+
+    private fun getXmlAttribute(parser: XmlPullParser, names: List<String>): String? {
+        val count = parser.attributeCount
+        for (target in names) {
+            for (i in 0 until count) {
+                val attrName = parser.getAttributeName(i)?.lowercase(Locale.US) ?: continue
+                if (attrName == target) {
+                    val v = parser.getAttributeValue(i)?.trim()
+                    if (!v.isNullOrEmpty()) return v
+                }
+            }
+        }
+        return null
+    }
+
+    private fun parseTextAndReceiverFormats(content: String): List<RadioChannel> {
+        val result = ArrayList<RadioChannel>()
+        val lines = content.split('\n')
+        var seq = 1
+
+        for (rawLine in lines) {
+            val line = stripBom(rawLine).trim()
+            if (line.isEmpty()) continue
+            if (line.startsWith("#") && !STREAM_URL_START.matcher(line).find()) continue
+
+            val matcher = STREAM_URL_START.matcher(line)
+            if (!matcher.find()) continue
+
+            val urlStart = matcher.start()
+            val prefixRaw = line.substring(0, urlStart).trim()
+            val restFromUrl = line.substring(urlStart).trim()
+
+            val isDirectivePrefix = prefixRaw.isEmpty() ||
+                RECEIVER_PREFIX_ONLY.matcher(prefixRaw).matches()
+
+            val (extractedUrl, trailingAfterUrl) = splitUrlAndTrailing(restFromUrl)
+            if (extractedUrl.isEmpty()) continue
+
+            val channelName = if (!isDirectivePrefix) {
+                cleanLabel(prefixRaw)
+            } else {
+                cleanLabel(trailingAfterUrl)
+            }.ifBlank { "قناة $seq" }
+
+            result.add(RadioChannel(name = channelName, url = extractedUrl))
+            seq++
+        }
+        return result
+    }
+
+    private fun splitUrlAndTrailing(textStartingWithUrl: String): Pair<String, String> {
+        var end = textStartingWithUrl.length
+        for (i in textStartingWithUrl.indices) {
+            val ch = textStartingWithUrl[i]
+            if (ch.isWhitespace() || ch == '|' || ch == '"' || ch == '\'' || ch == '<' || ch == '>') {
+                end = i
+                break
+            }
+            if (ch == ',') {
+                end = i
+                break
+            }
+            // Keep Shoutcast "/;" intact, but split on ';' if followed by a non-stream channel label
+            if (ch == ';') {
+                val prev = if (i > 0) textStartingWithUrl[i - 1] else ' '
+                val after = textStartingWithUrl.substring(i + 1)
+                val looksLikeShoutcastSuffix = prev == '/' &&
+                    (after.isEmpty() || after.startsWith("stream", ignoreCase = true))
+                if (!looksLikeShoutcastSuffix) {
+                    end = i
+                    break
+                }
+            }
+        }
+
+        val url = trimTrailingUrlPunctuation(textStartingWithUrl.substring(0, end))
+        val trailing = if (end < textStartingWithUrl.length) {
+            textStartingWithUrl.substring(end).trim()
+        } else {
+            ""
+        }
+        return url to trailing
+    }
+
+    private fun extractCleanUrl(textStartingWithUrl: String): String {
+        return splitUrlAndTrailing(textStartingWithUrl).first
+    }
+
+    private fun extractUrlFromField(field: String): String? {
+        val matcher = STREAM_URL_START.matcher(field)
+        if (!matcher.find()) return null
+        val url = extractCleanUrl(field.substring(matcher.start()))
+        return url.takeIf { it.isNotEmpty() }
+    }
+
+    private fun trimTrailingUrlPunctuation(rawUrl: String): String {
+        var u = rawUrl.trim()
+        while (u.isNotEmpty() && (u.endsWith("\"") || u.endsWith("'") || u.endsWith(")") || u.endsWith("]"))) {
+            u = u.dropLast(1)
+        }
+        return u
+    }
+
+    private fun cleanLabel(raw: String): String {
+        var s = raw.trim()
+        // Strip receiver directives like "I:" at the start if combined with a label
+        s = s.replace(Regex("(?i)^[ic]\\s*:\\s*"), "")
+        // Strip leading/trailing delimiters
+        while (s.isNotEmpty() && s.first() in charArrayOf(',', ';', '|', '=', ':', '-', '\t', '"', '\'')) {
+            s = s.drop(1).trim()
+        }
+        while (s.isNotEmpty() && s.last() in charArrayOf(',', ';', '|', '=', ':', '-', '\t', '"', '\'')) {
+            s = s.dropLast(1).trim()
+        }
+        return s.trim()
+    }
+
+    private fun extractNameFromUrl(url: String): String? {
+        return try {
+            val parsed = URL(url)
+            val seg = parsed.path.trimEnd('/').substringAfterLast('/')
+                .substringBeforeLast('.')
+                .trim()
+            seg.takeIf { it.isNotEmpty() } ?: parsed.host
+        } catch (_: Throwable) {
+            null
+        }
+    }
+}
+
+/**
+ * Manages persistence, importing, renaming, deleting, and sequential playback of
+ * multiple audio libraries stored in internal storage (`libraries.json`).
+ */
+class LibraryManager(context: Context) {
+
+    private val appContext = context.applicationContext
+    private val storageFile = File(appContext.filesDir, STORAGE_FILE_NAME)
+    private val prefs = FootSyncPrefs(appContext)
+    private val lock = Any()
+
+    private val libraries = mutableListOf<RadioLibrary>()
+
+    init {
+        loadFromDisk()
+    }
+
+    fun getLibraries(): List<RadioLibrary> = synchronized(lock) {
+        libraries.map { lib ->
+            lib.copy(channels = lib.channels.toMutableList())
+        }
+    }
+
+    fun getLibraryById(libraryId: String?): RadioLibrary? = synchronized(lock) {
+        if (libraryId == null) return@synchronized null
+        libraries.firstOrNull { it.id == libraryId }
+            ?.let { it.copy(channels = it.channels.toMutableList()) }
+    }
+
+    fun getActiveLibrary(): RadioLibrary = synchronized(lock) {
+        val activeId = prefs.getActiveLibraryId()
+        val found = libraries.firstOrNull { it.id == activeId } ?: libraries.first()
+        found.copy(channels = found.channels.toMutableList())
+    }
+
+    fun setActiveLibrary(libraryId: String): RadioLibrary = synchronized(lock) {
+        val found = libraries.firstOrNull { it.id == libraryId } ?: libraries.first()
+        prefs.setActiveLibraryId(found.id)
+        found.copy(channels = found.channels.toMutableList())
+    }
+
+    fun getManualLibrary(): RadioLibrary = synchronized(lock) {
+        ensureManualLibraryLocked()
+        libraries.first { it.isManualDefault }.let { it.copy(channels = it.channels.toMutableList()) }
+    }
+
+    fun addManualChannel(url: String, customName: String? = null): PlaybackTarget = synchronized(lock) {
+        val cleanUrl = url.trim()
+        val manual = ensureManualLibraryLocked()
+        val existingIdx = manual.channels.indexOfFirst { it.url.equals(cleanUrl, ignoreCase = true) }
+        val index = if (existingIdx >= 0) {
+            if (!customName.isNullOrBlank()) {
+                manual.channels[existingIdx] = manual.channels[existingIdx].copy(name = customName.trim())
+                saveToDiskLocked()
+            }
+            existingIdx
+        } else {
+            val name = customName?.trim()?.takeIf { it.isNotEmpty() }
+                ?: "رابط يدوي ${manual.channels.size + 1}"
+            manual.channels.add(RadioChannel(name = name, url = cleanUrl))
+            saveToDiskLocked()
+            manual.channels.lastIndex
+        }
+
+        prefs.setActiveLibraryId(manual.id)
+        prefs.saveLastPlayingPosition(manual.id, index)
+        PlaybackTarget(
+            libraryId = manual.id,
+            libraryName = manual.name,
+            index = index,
+            totalCount = manual.channels.size,
+            channel = manual.channels[index]
+        )
+    }
+
+    fun deleteChannel(libraryId: String, channelIndex: Int): Boolean = synchronized(lock) {
+        val lib = libraries.firstOrNull { it.id == libraryId } ?: return@synchronized false
+        if (channelIndex !in lib.channels.indices) return@synchronized false
+        lib.channels.removeAt(channelIndex)
+        saveToDiskLocked()
+        true
+    }
+
+    fun renameLibrary(libraryId: String, newName: String): Boolean = synchronized(lock) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty()) return@synchronized false
+        val lib = libraries.firstOrNull { it.id == libraryId } ?: return@synchronized false
+        if (lib.isManualDefault) return@synchronized false
+        val idx = libraries.indexOf(lib)
+        libraries[idx] = lib.copy(name = trimmed)
+        saveToDiskLocked()
+        true
+    }
+
+    fun deleteLibrary(libraryId: String): Boolean = synchronized(lock) {
+        val lib = libraries.firstOrNull { it.id == libraryId } ?: return@synchronized false
+        if (lib.isManualDefault) return@synchronized false
+        libraries.remove(lib)
+        if (prefs.getActiveLibraryId() == libraryId) {
+            prefs.setActiveLibraryId(libraries.first().id)
+        }
+        saveToDiskLocked()
+        true
+    }
+
+    fun queryDisplayName(uri: Uri): String {
+        try {
+            appContext.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val rawName = cursor.getString(idx)?.trim()
+                        if (!rawName.isNullOrEmpty()) {
+                            return rawName.substringBeforeLast('.').ifBlank { rawName }
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return uri.lastPathSegment
+            ?.substringAfterLast('/')
+            ?.substringBeforeLast('.')
+            ?.takeIf { it.isNotBlank() }
+            ?: "مكتبة مستوردة"
+    }
+
+    fun readTextFromUri(uri: Uri): String {
+        val sb = StringBuilder()
+        appContext.contentResolver.openInputStream(uri)?.use { input ->
+            BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8)).use { reader ->
+                val buffer = CharArray(8192)
+                while (true) {
+                    val read = reader.read(buffer)
+                    if (read < 0) break
+                    sb.append(buffer, 0, read)
+                    if (sb.length > MAX_PLAYLIST_CHARS) break
+                }
+            }
+        } ?: throw IllegalStateException("تعذّر فتح الملف المحدد.")
+        return sb.toString()
+    }
+
+    fun importFromUri(uri: Uri, customLibraryName: String? = null): ImportResult {
+        return try {
+            val content = readTextFromUri(uri)
+            val libName = customLibraryName?.trim()?.takeIf { it.isNotEmpty() }
+                ?: queryDisplayName(uri)
+            importFromRawText(libName, content, sourceUrl = null)
+        } catch (t: Throwable) {
+            ImportResult(
+                success = false,
+                errorMessage = "فشل قراءة الملف: ${t.message ?: "خطأ غير معروف"}"
+            )
+        }
+    }
+
+    fun importFromUrl(playlistUrl: String, customLibraryName: String? = null): ImportResult {
+        val cleanUrl = playlistUrl.trim()
+        if (!cleanUrl.startsWith("http://", ignoreCase = true) &&
+            !cleanUrl.startsWith("https://", ignoreCase = true)
+        ) {
+            return ImportResult(
+                success = false,
+                errorMessage = "الرابط يجب أن يبدأ بـ http:// أو https://"
+            )
+        }
+
+        return try {
+            val text = downloadText(cleanUrl)
+            val defaultName = customLibraryName?.trim()?.takeIf { it.isNotEmpty() }
+                ?: deriveNameFromUrl(cleanUrl)
+            importFromRawText(defaultName, text, sourceUrl = cleanUrl)
+        } catch (t: Throwable) {
+            ImportResult(
+                success = false,
+                errorMessage = "تعذّر تحميل القائمة من الرابط: ${t.message ?: "خطأ في الاتصال"}"
+            )
+        }
+    }
+
+    fun importFromRawText(
+        libraryName: String,
+        rawText: String,
+        sourceUrl: String? = null
+    ): ImportResult {
+        val cleanName = libraryName.trim().ifEmpty { "مكتبة صوتية" }
+        val parsed = UniversalPlaylistParser.parse(
+            rawContent = rawText,
+            sourceUrl = sourceUrl,
+            fallbackTitle = cleanName
+        )
+
+        if (parsed.channels.isEmpty()) {
+            return ImportResult(
+                success = false,
+                errorMessage = "لم يتم العثور على أي روابط بث صالحة داخل المحتوى."
+            )
+        }
+
+        val newLibrary = RadioLibrary(
+            id = UUID.randomUUID().toString(),
+            name = cleanName,
+            isManualDefault = false,
+            channels = parsed.channels.toMutableList()
+        )
+
+        synchronized(lock) {
+            libraries.add(newLibrary)
+            prefs.setActiveLibraryId(newLibrary.id)
+            saveToDiskLocked()
+        }
+
+        return ImportResult(
+            success = true,
+            library = newLibrary.copy(channels = newLibrary.channels.toMutableList()),
+            channelCount = newLibrary.channels.size,
+            detectedFormat = parsed.formatName
+        )
+    }
+
+    fun getTarget(libraryId: String, index: Int): PlaybackTarget? = synchronized(lock) {
+        val lib = libraries.firstOrNull { it.id == libraryId } ?: return@synchronized null
+        if (lib.channels.isEmpty()) return@synchronized null
+        val safeIdx = index.coerceIn(0, lib.channels.lastIndex)
+        PlaybackTarget(
+            libraryId = lib.id,
+            libraryName = lib.name,
+            index = safeIdx,
+            totalCount = lib.channels.size,
+            channel = lib.channels[safeIdx]
+        )
+    }
+
+    /**
+     * Resolves the next sequential channel in [libraryId] (wraps cleanly from last to first).
+     */
+    fun stepChannel(libraryId: String?, currentIndex: Int, delta: Int): PlaybackTarget? =
+        synchronized(lock) {
+            val lib = libraries.firstOrNull { it.id == libraryId }
+                ?: libraries.firstOrNull { it.id == prefs.getActiveLibraryId() }
+                ?: libraries.firstOrNull { it.channels.isNotEmpty() }
+                ?: return@synchronized null
+
+            if (lib.channels.isEmpty()) return@synchronized null
+            val size = lib.channels.size
+            val nextIdx = ((currentIndex + delta) % size + size) % size
+            prefs.setActiveLibraryId(lib.id)
+            prefs.saveLastPlayingPosition(lib.id, nextIdx)
+            PlaybackTarget(
+                libraryId = lib.id,
+                libraryName = lib.name,
+                index = nextIdx,
+                totalCount = size,
+                channel = lib.channels[nextIdx]
+            )
+        }
+
+    fun getLastOrFirstTarget(): PlaybackTarget? = synchronized(lock) {
+        val lastLibId = prefs.getLastPlayingLibraryId()
+        val lastIdx = prefs.getLastPlayingChannelIndex()
+        if (lastLibId != null) {
+            val lib = libraries.firstOrNull { it.id == lastLibId && it.channels.isNotEmpty() }
+            if (lib != null) {
+                val safeIdx = lastIdx.coerceIn(0, lib.channels.lastIndex)
+                return@synchronized PlaybackTarget(
+                    libraryId = lib.id,
+                    libraryName = lib.name,
+                    index = safeIdx,
+                    totalCount = lib.channels.size,
+                    channel = lib.channels[safeIdx]
+                )
+            }
+        }
+        val firstNonEmpty = libraries.firstOrNull { it.channels.isNotEmpty() } ?: return@synchronized null
+        PlaybackTarget(
+            libraryId = firstNonEmpty.id,
+            libraryName = firstNonEmpty.name,
+            index = 0,
+            totalCount = firstNonEmpty.channels.size,
+            channel = firstNonEmpty.channels[0]
+        )
+    }
+
+    private fun downloadText(urlString: String): String {
+        var currentUrl = urlString
+        var redirects = 0
+        while (redirects < 5) {
+            val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 15_000
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "FootSyncRadio/1.0 (Android)")
+                setRequestProperty("Accept", "*/*")
+            }
+            try {
+                val code = conn.responseCode
+                if (code in 300..399) {
+                    val location = conn.getHeaderField("Location")
+                        ?: throw IllegalStateException("إعادة توجيه بدون عنوان")
+                    currentUrl = URL(URL(currentUrl), location).toString()
+                    redirects++
+                    continue
+                }
+                if (code !in 200..299) {
+                    throw IllegalStateException("HTTP $code")
+                }
+                val contentType = conn.contentType?.lowercase(Locale.US) ?: ""
+                // If the remote server is directly streaming audio (audio/*), don't try to read infinite bytes
+                if (contentType.startsWith("audio/") && !contentType.contains("mpegurl")) {
+                    return currentUrl
+                }
+                val sb = StringBuilder()
+                BufferedReader(InputStreamReader(conn.inputStream, StandardCharsets.UTF_8)).use { reader ->
+                    val buf = CharArray(8192)
+                    while (true) {
+                        val n = reader.read(buf)
+                        if (n < 0) break
+                        sb.append(buf, 0, n)
+                        if (sb.length > MAX_PLAYLIST_CHARS) break
+                    }
+                }
+                return sb.toString()
+            } finally {
+                conn.disconnect()
+            }
+        }
+        throw IllegalStateException("عدد إعادة التوجيهات تجاوز الحد المسموح")
+    }
+
+    private fun deriveNameFromUrl(url: String): String {
+        return try {
+            val parsed = URL(url)
+            val file = parsed.path.trimEnd('/').substringAfterLast('/')
+                .substringBeforeLast('.')
+                .trim()
+            if (file.isNotEmpty()) file else (parsed.host ?: "مكتبة رابط")
+        } catch (_: Throwable) {
+            "مكتبة رابط"
+        }
+    }
+
+    private fun loadFromDisk() = synchronized(lock) {
+        libraries.clear()
+        if (storageFile.exists()) {
+            try {
+                val raw = storageFile.readText(StandardCharsets.UTF_8)
+                val root = JSONObject(raw)
+                val arr = root.optJSONArray("libraries") ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val id = obj.optString("id", UUID.randomUUID().toString())
+                    val name = obj.optString("name", "مكتبة")
+                    val isManual = obj.optBoolean("isManualDefault", id == MANUAL_LIBRARY_ID)
+                    val chArr = obj.optJSONArray("channels") ?: JSONArray()
+                    val channels = mutableListOf<RadioChannel>()
+                    for (j in 0 until chArr.length()) {
+                        val cObj = chArr.optJSONObject(j) ?: continue
+                        val cUrl = cObj.optString("url", "").trim()
+                        if (cUrl.isEmpty()) continue
+                        val cId = cObj.optString("id", UUID.randomUUID().toString())
+                        val cName = cObj.optString("name", "قناة ${j + 1}")
+                        channels.add(RadioChannel(id = cId, name = cName, url = cUrl))
+                    }
+                    libraries.add(
+                        RadioLibrary(
+                            id = id,
+                            name = name,
+                            isManualDefault = isManual,
+                            channels = channels
+                        )
+                    )
+                }
+            } catch (_: Throwable) {
+                libraries.clear()
+            }
+        }
+        ensureManualLibraryLocked()
+        if (prefs.getActiveLibraryId().isNullOrEmpty()) {
+            prefs.setActiveLibraryId(libraries.first().id)
+        }
+        saveToDiskLocked()
+    }
+
+    private fun ensureManualLibraryLocked(): RadioLibrary {
+        val existing = libraries.firstOrNull { it.isManualDefault || it.id == MANUAL_LIBRARY_ID }
+        if (existing != null) return existing
+        val manual = RadioLibrary(
+            id = MANUAL_LIBRARY_ID,
+            name = MANUAL_LIBRARY_NAME,
+            isManualDefault = true,
+            channels = mutableListOf()
+        )
+        libraries.add(0, manual)
+        return manual
+    }
+
+    private fun saveToDiskLocked() {
+        try {
+            val root = JSONObject()
+            val arr = JSONArray()
+            for (lib in libraries) {
+                val obj = JSONObject()
+                obj.put("id", lib.id)
+                obj.put("name", lib.name)
+                obj.put("isManualDefault", lib.isManualDefault)
+                val chArr = JSONArray()
+                for (ch in lib.channels) {
+                    val cObj = JSONObject()
+                    cObj.put("id", ch.id)
+                    cObj.put("name", ch.name)
+                    cObj.put("url", ch.url)
+                    chArr.put(cObj)
+                }
+                obj.put("channels", chArr)
+                arr.put(obj)
+            }
+            root.put("libraries", arr)
+            val tmp = File(appContext.filesDir, "$STORAGE_FILE_NAME.tmp")
+            tmp.writeText(root.toString(), StandardCharsets.UTF_8)
+            if (storageFile.exists()) {
+                storageFile.delete()
+            }
+            if (!tmp.renameTo(storageFile)) {
+                storageFile.writeText(root.toString(), StandardCharsets.UTF_8)
+                tmp.delete()
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    companion object {
+        private const val STORAGE_FILE_NAME = "libraries.json"
+        const val MANUAL_LIBRARY_ID = "manual_default_library"
+        const val MANUAL_LIBRARY_NAME = "روابط يدوية"
+        private const val MAX_PLAYLIST_CHARS = 4 * 1024 * 1024
+    }
+}
