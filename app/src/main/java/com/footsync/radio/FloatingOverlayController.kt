@@ -18,6 +18,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -34,6 +35,7 @@ data class OverlayState(
     val isPlaying: Boolean = false,
     val isMuted: Boolean = false,
     val isSyncing: Boolean = false,
+    val syncElapsedSec: Int = 0,
     val syncStatusText: String = ""
 )
 
@@ -52,11 +54,7 @@ interface OverlayCallbacks {
 }
 
 /**
- * Lightweight, touch-friendly floating overlay for Android smartphones.
- * Supports:
- * - Expanded compact RTL panel (station name, live delay, Prev/Next, ±0.25s/±1s, Play/Pause, Mute, Sync, Minimize, Hide)
- * - Minimized draggable floating delay pill (drag anywhere on screen, tap to expand)
- * - FLAG_NOT_FOCUSABLE so touches outside interact normally with underlying apps
+ * Lightweight, touch-friendly floating overlay for Android smartphones using `fonts/app_font.ttf`.
  */
 class FloatingOverlayController(
     context: Context,
@@ -67,6 +65,17 @@ class FloatingOverlayController(
     private val prefs = FootSyncPrefs(appContext)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val touchSlop = ViewConfiguration.get(appContext).scaledTouchSlop
+
+    private val appTypeface: Typeface = try {
+        Typeface.createFromAsset(appContext.assets, APP_FONT_ASSET_PATH)
+    } catch (_: Throwable) {
+        Typeface.DEFAULT
+    }
+    private val appTypefaceBold: Typeface = try {
+        Typeface.create(appTypeface, Typeface.BOLD)
+    } catch (_: Throwable) {
+        appTypeface
+    }
 
     private var rootView: LinearLayout? = null
     private var layoutParams: WindowManager.LayoutParams? = null
@@ -186,6 +195,7 @@ class FloatingOverlayController(
 
         root.addView(expanded)
         root.addView(minimized)
+        applyFontRecursively(root)
 
         rootView = root
         layoutParams = params
@@ -223,7 +233,6 @@ class FloatingOverlayController(
             elevation = dp(10).toFloat()
         }
 
-        // Row 1: Draggable Header (Station Name + Minimize + Hide)
         val headerRow = LinearLayout(appContext).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -236,7 +245,7 @@ class FloatingOverlayController(
         val stationView = TextView(appContext).apply {
             setTextColor(COLOR_TEXT_PRIMARY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = appTypefaceBold
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -264,7 +273,6 @@ class FloatingOverlayController(
         headerRow.addView(btnClose)
         attachDragHandler(headerRow, onTap = null)
 
-        // Row 2: Live Delay Readout + Prev/Next Channel
         val delayRow = LinearLayout(appContext).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -284,7 +292,7 @@ class FloatingOverlayController(
         val delayView = TextView(appContext).apply {
             setTextColor(COLOR_ACCENT)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            typeface = appTypefaceBold
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.35f).apply {
                 marginStart = dp(6)
@@ -302,10 +310,10 @@ class FloatingOverlayController(
         delayRow.addView(delayView)
         delayRow.addView(btnNext)
 
-        // Optional live sync status line
         val syncStatusView = TextView(appContext).apply {
             setTextColor(COLOR_WARNING)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = appTypeface
             gravity = Gravity.CENTER
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
@@ -319,7 +327,6 @@ class FloatingOverlayController(
         }
         tvSyncStatus = syncStatusView
 
-        // Row 3: Fine Delay Adjustments (-1s, -0.25s, +0.25s, +1s)
         val tuneRow = LinearLayout(appContext).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
@@ -347,7 +354,6 @@ class FloatingOverlayController(
             tuneRow.addView(btn)
         }
 
-        // Row 4: Play/Pause, Mute, Sync
         val controlRow = LinearLayout(appContext).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -372,7 +378,7 @@ class FloatingOverlayController(
         }
         btnMute = muteBtn
 
-        val syncBtn = makeActionButton("زامن", COLOR_ACCENT_DARK, COLOR_TEXT_ON_ACCENT, heightDp = 38).apply {
+        val syncBtn = makeActionButton("زامن", COLOR_ACCENT_BLUE, Color.WHITE, heightDp = 38).apply {
             layoutParams = LinearLayout.LayoutParams(0, dp(38), 1.15f).apply {
                 marginStart = dp(6)
             }
@@ -402,7 +408,7 @@ class FloatingOverlayController(
             setPadding(dp(12), dp(9), dp(12), dp(9))
             background = roundedDrawable(
                 fillColor = COLOR_BG_PILL,
-                strokeColor = COLOR_ACCENT,
+                strokeColor = COLOR_ACCENT_BLUE,
                 strokeWidthPx = dp(1),
                 radiusPx = dp(24).toFloat()
             )
@@ -425,7 +431,7 @@ class FloatingOverlayController(
         val delayText = TextView(appContext).apply {
             setTextColor(COLOR_TEXT_PRIMARY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            typeface = appTypefaceBold
             text = "0.00 ث"
         }
         tvPillDelay = delayText
@@ -525,7 +531,11 @@ class FloatingOverlayController(
 
         tvStation?.text = titleText
         tvDelay?.text = delayLabel
-        tvPillDelay?.text = if (state.isSyncing) "مزامنة…" else delayLabel
+        tvPillDelay?.text = if (state.isSyncing) {
+            "مزامنة ${state.syncElapsedSec} ث"
+        } else {
+            delayLabel
+        }
 
         btnPlayPause?.text = if (state.isPlaying) "إيقاف" else "تشغيل"
         btnMute?.text = if (state.isMuted) "إلغاء الكتم" else "كتم"
@@ -536,13 +546,13 @@ class FloatingOverlayController(
         )
         btnMute?.setTextColor(if (state.isMuted) COLOR_WARNING else COLOR_TEXT_PRIMARY)
 
-        btnSync?.text = if (state.isSyncing) "إلغاء المزامنة" else "زامن"
+        btnSync?.text = if (state.isSyncing) "إلغاء (${state.syncElapsedSec} ث)" else "زامن"
         btnSync?.background = rippleButtonDrawable(
-            if (state.isSyncing) COLOR_DANGER else COLOR_ACCENT_DARK,
+            if (state.isSyncing) COLOR_DANGER else COLOR_ACCENT_BLUE,
             Color.TRANSPARENT,
             dp(10).toFloat()
         )
-        btnSync?.setTextColor(if (state.isSyncing) Color.WHITE else COLOR_TEXT_ON_ACCENT)
+        btnSync?.setTextColor(Color.WHITE)
 
         if (state.isSyncing && state.syncStatusText.isNotBlank()) {
             tvSyncStatus?.text = state.syncStatusText
@@ -552,7 +562,7 @@ class FloatingOverlayController(
         }
 
         val dotColor = when {
-            state.isSyncing -> COLOR_WARNING
+            state.isSyncing -> COLOR_ACCENT_BLUE
             state.isMuted -> COLOR_DANGER
             state.isPlaying -> COLOR_ACCENT
             else -> COLOR_TEXT_MUTED
@@ -565,12 +575,24 @@ class FloatingOverlayController(
         )
     }
 
+    private fun applyFontRecursively(view: View) {
+        if (view is TextView) {
+            val isBold = view.typeface?.isBold == true
+            view.typeface = if (isBold) appTypefaceBold else appTypeface
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                applyFontRecursively(view.getChildAt(i))
+            }
+        }
+    }
+
     private fun makeHeaderChip(text: String, bgColor: Int, textColor: Int): TextView {
         return TextView(appContext).apply {
             this.text = text
             setTextColor(textColor)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = appTypefaceBold
             gravity = Gravity.CENTER
             setPadding(dp(9), dp(5), dp(9), dp(5))
             layoutParams = LinearLayout.LayoutParams(
@@ -591,7 +613,7 @@ class FloatingOverlayController(
             this.text = text
             setTextColor(textColor)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            typeface = Typeface.DEFAULT_BOLD
+            typeface = appTypefaceBold
             gravity = Gravity.CENTER
             minHeight = dp(heightDp)
             background = rippleButtonDrawable(bgColor, Color.TRANSPARENT, dp(10).toFloat())
@@ -637,19 +659,20 @@ class FloatingOverlayController(
     }
 
     companion object {
-        private val COLOR_BG_PANEL = Color.parseColor("#EE111827")
-        private val COLOR_BG_PILL = Color.parseColor("#F00F172A")
+        private const val APP_FONT_ASSET_PATH = "fonts/app_font.ttf"
+
+        private val COLOR_BG_PANEL = Color.parseColor("#EE121212")
+        private val COLOR_BG_PILL = Color.parseColor("#F00A0D12")
         private val COLOR_BORDER = Color.parseColor("#33475569")
-        private val COLOR_BTN_NEUTRAL = Color.parseColor("#1E293B")
-        private val COLOR_BTN_SUBTLE = Color.parseColor("#273549")
+        private val COLOR_BTN_NEUTRAL = Color.parseColor("#1E1E1E")
+        private val COLOR_BTN_SUBTLE = Color.parseColor("#2A2A2A")
         private val COLOR_ACCENT = Color.parseColor("#22C55E")
-        private val COLOR_ACCENT_DARK = Color.parseColor("#16A34A")
-        private val COLOR_TEXT_ON_ACCENT = Color.parseColor("#04150A")
+        private val COLOR_ACCENT_BLUE = Color.parseColor("#0A84FF")
         private val COLOR_WARNING = Color.parseColor("#FBBF24")
         private val COLOR_WARNING_SOFT = Color.parseColor("#33FBBF24")
-        private val COLOR_DANGER = Color.parseColor("#F87171")
+        private val COLOR_DANGER = Color.parseColor("#EF4444")
         private val COLOR_BTN_DANGER_SOFT = Color.parseColor("#33EF4444")
-        private val COLOR_TEXT_PRIMARY = Color.parseColor("#F8FAFC")
-        private val COLOR_TEXT_MUTED = Color.parseColor("#94A3B8")
+        private val COLOR_TEXT_PRIMARY = Color.parseColor("#FFFFFF")
+        private val COLOR_TEXT_MUTED = Color.parseColor("#9E9E9E")
     }
 }
