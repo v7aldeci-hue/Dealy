@@ -9,6 +9,7 @@ import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.io.StringReader
 import java.net.HttpURLConnection
@@ -256,7 +257,6 @@ object UniversalPlaylistParser {
             upper.contains("#EXT-X-MEDIA-SEQUENCE") ||
             upper.contains("#EXT-X-STREAM-INF")
         if (!hasHlsTags) return false
-        // If it contains standard IPTV #EXTINF:-1 entries with full http(s) URLs, parse as IPTV M3U
         val hasIptvExtinf = upper.contains("#EXTINF:-1") || upper.contains("TVG-NAME=")
         return !hasIptvExtinf
     }
@@ -316,7 +316,6 @@ object UniversalPlaylistParser {
     }
 
     private fun extractExtinfTitle(extinfLine: String): String? {
-        // Find the first comma outside double quotes (separates duration/attributes from channel title)
         var inQuotes = false
         var commaIndex = -1
         for (i in extinfLine.indices) {
@@ -391,7 +390,6 @@ object UniversalPlaylistParser {
             val direct = root.optJSONArray(key)
             if (direct != null) return direct
         }
-        // Check case-insensitive keys
         val keys = root.keys()
         while (keys.hasNext()) {
             val k = keys.next()
@@ -400,7 +398,6 @@ object UniversalPlaylistParser {
                 return arr
             }
         }
-        // Check one level deeper (e.g. {"data": {"channels": [...]}})
         val nestedKeys = root.keys()
         while (nestedKeys.hasNext()) {
             val k = nestedKeys.next()
@@ -420,7 +417,6 @@ object UniversalPlaylistParser {
                 if (value.isNotEmpty()) return value
             }
         }
-        // Case-insensitive fallback
         val lowerSet = candidateKeys.map { it.lowercase(Locale.US) }.toSet()
         val iter = obj.keys()
         while (iter.hasNext()) {
@@ -436,7 +432,6 @@ object UniversalPlaylistParser {
     private fun parseXml(content: String): List<RadioChannel> {
         val result = ArrayList<RadioChannel>()
         try {
-            // Escape raw '&' frequently found inside IPTV/receiver XML stream URLs
             val sanitized = BARE_AMPERSAND.matcher(content).replaceAll("&amp;")
             val factory = XmlPullParserFactory.newInstance()
             factory.isNamespaceAware = false
@@ -584,7 +579,6 @@ object UniversalPlaylistParser {
                 end = i
                 break
             }
-            // Keep Shoutcast "/;" intact, but split on ';' if followed by a non-stream channel label
             if (ch == ';') {
                 val prev = if (i > 0) textStartingWithUrl[i - 1] else ' '
                 val after = textStartingWithUrl.substring(i + 1)
@@ -627,9 +621,7 @@ object UniversalPlaylistParser {
 
     private fun cleanLabel(raw: String): String {
         var s = raw.trim()
-        // Strip receiver directives like "I:" at the start if combined with a label
         s = s.replace(Regex("(?i)^[ic]\\s*:\\s*"), "")
-        // Strip leading/trailing delimiters
         while (s.isNotEmpty() && s.first() in charArrayOf(',', ';', '|', '=', ':', '-', '\t', '"', '\'')) {
             s = s.drop(1).trim()
         }
@@ -653,10 +645,13 @@ object UniversalPlaylistParser {
 }
 
 /**
- * Manages persistence, importing, renaming, deleting, and sequential playback of
- * multiple audio libraries stored in internal storage (`libraries.json`).
+ * Thread-safe Singleton managing persistence, importing, renaming, deleting, and sequential
+ * playback of multiple audio libraries stored atomically in `filesDir/libraries.json`.
+ *
+ * Both `LibraryManager.getInstance(context)` and `LibraryManager(context)` resolve to the same
+ * shared Singleton instance so MainActivity and RadioPlaybackService never overwrite each other.
  */
-class LibraryManager(context: Context) {
+class LibraryManager private constructor(context: Context) {
 
     private val appContext = context.applicationContext
     private val storageFile = File(appContext.filesDir, STORAGE_FILE_NAME)
@@ -947,7 +942,7 @@ class LibraryManager(context: Context) {
         var redirects = 0
         while (redirects < 5) {
             val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 10_000
+                connectTimeout = 15_000
                 readTimeout = 15_000
                 instanceFollowRedirects = false
                 setRequestProperty("User-Agent", "FootSyncRadio/1.0 (Android)")
@@ -966,7 +961,6 @@ class LibraryManager(context: Context) {
                     throw IllegalStateException("HTTP $code")
                 }
                 val contentType = conn.contentType?.lowercase(Locale.US) ?: ""
-                // If the remote server is directly streaming audio (audio/*), don't try to read infinite bytes
                 if (contentType.startsWith("audio/") && !contentType.contains("mpegurl")) {
                     return currentUrl
                 }
@@ -1002,7 +996,10 @@ class LibraryManager(context: Context) {
 
     private fun loadFromDisk() = synchronized(lock) {
         libraries.clear()
-        if (storageFile.exists()) {
+        val fileExisted = storageFile.exists() && storageFile.length() > 0L
+        var loadedCleanly = false
+
+        if (fileExisted) {
             try {
                 val raw = storageFile.readText(StandardCharsets.UTF_8)
                 val root = JSONObject(raw)
@@ -1031,15 +1028,21 @@ class LibraryManager(context: Context) {
                         )
                     )
                 }
+                loadedCleanly = true
             } catch (_: Throwable) {
+                // Never overwrite an existing libraries.json if reading/parsing failed
                 libraries.clear()
             }
         }
+
         ensureManualLibraryLocked()
         if (prefs.getActiveLibraryId().isNullOrEmpty()) {
             prefs.setActiveLibraryId(libraries.first().id)
         }
-        saveToDiskLocked()
+        // Only write initial file if none existed yet
+        if (!fileExisted && !loadedCleanly) {
+            saveToDiskLocked()
+        }
     }
 
     private fun ensureManualLibraryLocked(): RadioLibrary {
@@ -1076,14 +1079,29 @@ class LibraryManager(context: Context) {
                 arr.put(obj)
             }
             root.put("libraries", arr)
+            val jsonBytes = root.toString().toByteArray(StandardCharsets.UTF_8)
+
             val tmp = File(appContext.filesDir, "$STORAGE_FILE_NAME.tmp")
-            tmp.writeText(root.toString(), StandardCharsets.UTF_8)
-            if (storageFile.exists()) {
-                storageFile.delete()
+            FileOutputStream(tmp).use { fos ->
+                fos.write(jsonBytes)
+                fos.flush()
+                try {
+                    fos.fd.sync()
+                } catch (_: Throwable) {
+                }
             }
-            if (!tmp.renameTo(storageFile)) {
-                storageFile.writeText(root.toString(), StandardCharsets.UTF_8)
-                tmp.delete()
+
+            if (storageFile.exists() && !tmp.renameTo(storageFile)) {
+                storageFile.delete()
+                if (!tmp.renameTo(storageFile)) {
+                    FileOutputStream(storageFile).use { fos ->
+                        fos.write(jsonBytes)
+                        fos.flush()
+                    }
+                    tmp.delete()
+                }
+            } else if (!storageFile.exists()) {
+                tmp.renameTo(storageFile)
             }
         } catch (_: Throwable) {
         }
@@ -1094,5 +1112,16 @@ class LibraryManager(context: Context) {
         const val MANUAL_LIBRARY_ID = "manual_default_library"
         const val MANUAL_LIBRARY_NAME = "روابط يدوية"
         private const val MAX_PLAYLIST_CHARS = 4 * 1024 * 1024
+
+        @Volatile
+        private var instance: LibraryManager? = null
+
+        fun getInstance(context: Context): LibraryManager {
+            return instance ?: synchronized(this) {
+                instance ?: LibraryManager(context.applicationContext).also { instance = it }
+            }
+        }
+
+        operator fun invoke(context: Context): LibraryManager = getInstance(context)
     }
 }
