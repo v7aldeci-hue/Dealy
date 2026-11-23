@@ -68,6 +68,7 @@ import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -103,8 +104,8 @@ data class ServiceUiState(
 
 /**
  * Circular PCM ring buffer supporting up to 180 seconds of live delay (185s capacity)
- * with zero-allocation hot path, strict frame alignment, direct pass-through at 0ms delay,
- * glitch-free cosine crossfade transitions, and monotonic speaker-aligned timestamping.
+ * with zero-allocation hot path, PCM-level output muting (while keeping unmuted ring history),
+ * cursor-based history reads for [SyncEngine] (mirroring Lu0/k0 + Lu0/L0), and exact latency tracking.
  */
 @OptIn(UnstableApi::class)
 class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
@@ -120,10 +121,13 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     private var maxScratchFrames = 0
 
     private var totalFramesWritten = 0L
-    private var anchorZeroDelayNs = Long.MIN_VALUE
+    private var anchorWriteTimeNs = Long.MIN_VALUE
+    private var streamGeneration = 0L
 
     @Volatile
     private var requestedDelayMs = 0L
+    @Volatile
+    private var outputMuted = false
     private var activeDelayFrames = 0L
     private var previousDelayFrames = 0L
     private var crossfadeRemaining = 0
@@ -132,15 +136,16 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     @Volatile
     private var sinkLatencyNs = DEFAULT_SINK_LATENCY_NS
 
-    @Volatile
-    private var liveTap: ((ShortArray, Int, Int, Int, Long) -> Unit)? = null
-
     fun setDelaySeconds(seconds: Double) {
         val clamped = seconds.coerceIn(0.0, MAX_DELAY_SECONDS)
         requestedDelayMs = (clamped * 1000.0).roundToLong()
     }
 
     fun getDelaySeconds(): Double = requestedDelayMs.toDouble() / 1000.0
+
+    fun setOutputMuted(muted: Boolean) {
+        outputMuted = muted
+    }
 
     fun updateOutputLatencyNs(latencyNs: Long) {
         if (latencyNs in 0L..MAX_SINK_LATENCY_NS) {
@@ -160,8 +165,9 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     }
 
     fun clearHistory() = synchronized(ringLock) {
+        streamGeneration++
         totalFramesWritten = 0L
-        anchorZeroDelayNs = Long.MIN_VALUE
+        anchorWriteTimeNs = Long.MIN_VALUE
         crossfadeRemaining = 0
         activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
         previousDelayFrames = activeDelayFrames
@@ -191,8 +197,9 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                 maxScratchFrames = sampleRate
                 scratchIn = ShortArray(maxScratchFrames * channelCount)
             }
+            streamGeneration++
             totalFramesWritten = 0L
-            anchorZeroDelayNs = Long.MIN_VALUE
+            anchorWriteTimeNs = Long.MIN_VALUE
             activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
             previousDelayFrames = activeDelayFrames
             crossfadeRemaining = 0
@@ -227,44 +234,36 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         val outBuf = replaceOutputBuffer(alignedBytes)
         outBuf.order(ByteOrder.LITTLE_ENDIAN)
 
+        val muteOut = outputMuted
         val nowNs = System.nanoTime()
         val chunkDurationNs = (frameCount.toLong() * NANOS_PER_SEC) / sampleRate.toLong()
-        val measuredChunkStartNs = (nowNs - chunkDurationNs) + sinkLatencyNs
-
-        var chunkStartTimeNs: Long
-        var tapSnapshot: ((ShortArray, Int, Int, Int, Long) -> Unit)?
-        val srSnapshot: Int
-        val chSnapshot: Int
+        // Pure ring-write start time (output latency is added separately in SyncEngine just like LG/l)
+        val measuredWriteStartNs = nowNs - chunkDurationNs
 
         synchronized(ringLock) {
             if (ringBuffer.isEmpty()) {
                 for (i in 0 until totalShorts) {
-                    outBuf.putShort(scratchIn[i])
+                    outBuf.putShort(if (muteOut) 0 else scratchIn[i])
                 }
                 outBuf.flip()
                 return
             }
 
-            srSnapshot = sampleRate
-            chSnapshot = channelCount
             val cap = capacityFrames.toLong()
 
-            if (anchorZeroDelayNs == Long.MIN_VALUE) {
-                anchorZeroDelayNs = measuredChunkStartNs -
+            if (anchorWriteTimeNs == Long.MIN_VALUE) {
+                anchorWriteTimeNs = measuredWriteStartNs -
                     (totalFramesWritten * NANOS_PER_SEC) / sampleRate.toLong()
             } else {
-                val predictedStartNs = anchorZeroDelayNs +
+                val predictedStartNs = anchorWriteTimeNs +
                     (totalFramesWritten * NANOS_PER_SEC) / sampleRate.toLong()
-                val errNs = measuredChunkStartNs - predictedStartNs
-                anchorZeroDelayNs += if (abs(errNs) > 350_000_000L) {
+                val errNs = measuredWriteStartNs - predictedStartNs
+                anchorWriteTimeNs += if (abs(errNs) > 350_000_000L) {
                     errNs
                 } else {
                     errNs / 40L
                 }
             }
-
-            chunkStartTimeNs = anchorZeroDelayNs +
-                (totalFramesWritten * NANOS_PER_SEC) / sampleRate.toLong()
 
             val delayMs = requestedDelayMs
             val targetDelayFrames = delayMsToFramesLocked(delayMs)
@@ -283,7 +282,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                     for (c in 0 until channelCount) {
                         val s = scratchIn[inBase + c]
                         ringBuffer[writeBase + c] = s
-                        outBuf.putShort(s)
+                        outBuf.putShort(if (muteOut) 0 else s)
                     }
                     totalFramesWritten++
                 }
@@ -307,29 +306,37 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                         val fadeOut = 1.0f - fadeIn
                         crossfadeRemaining--
 
-                        for (c in 0 until channelCount) {
-                            val sOld = readSampleLocked(oldReadFrame, oldestAvailable, c)
-                            val sNew = readSampleLocked(newReadFrame, oldestAvailable, c)
-                            val mixed = (sOld * fadeOut + sNew * fadeIn)
-                                .toInt()
-                                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                                .toShort()
-                            outBuf.putShort(mixed)
+                        if (muteOut) {
+                            for (c in 0 until channelCount) {
+                                outBuf.putShort(0)
+                            }
+                        } else {
+                            for (c in 0 until channelCount) {
+                                val sOld = readSampleLocked(oldReadFrame, oldestAvailable, c)
+                                val sNew = readSampleLocked(newReadFrame, oldestAvailable, c)
+                                val mixed = (sOld * fadeOut + sNew * fadeIn)
+                                    .toInt()
+                                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                                    .toShort()
+                                outBuf.putShort(mixed)
+                            }
                         }
                     } else {
-                        for (c in 0 until channelCount) {
-                            outBuf.putShort(readSampleLocked(newReadFrame, oldestAvailable, c))
+                        if (muteOut) {
+                            for (c in 0 until channelCount) {
+                                outBuf.putShort(0)
+                            }
+                        } else {
+                            for (c in 0 until channelCount) {
+                                outBuf.putShort(readSampleLocked(newReadFrame, oldestAvailable, c))
+                            }
                         }
                     }
                 }
             }
-
-            tapSnapshot = liveTap
         }
 
         outBuf.flip()
-
-        tapSnapshot?.invoke(scratchIn, frameCount, chSnapshot, srSnapshot, chunkStartTimeNs)
     }
 
     private fun readSampleLocked(frameIndex: Long, oldestAvailable: Long, channel: Int): Short {
@@ -361,8 +368,9 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
 
     override fun onReset() {
         synchronized(ringLock) {
+            streamGeneration++
             totalFramesWritten = 0L
-            anchorZeroDelayNs = Long.MIN_VALUE
+            anchorWriteTimeNs = Long.MIN_VALUE
             crossfadeRemaining = 0
             ringBuffer = ShortArray(0)
             scratchIn = ShortArray(0)
@@ -370,73 +378,50 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         }
     }
 
-    override fun setLivePcmTap(
-        tap: ((pcm: ShortArray, frameCount: Int, channels: Int, sampleRate: Int, startTimeNs: Long) -> Unit)?
-    ) {
-        liveTap = tap
+    // === RadioPcmSource (Exact Lu0/k0 + Lu0/L0 cursor access) ===
+
+    override fun getStreamAnchor(): LongArray? = synchronized(ringLock) {
+        if (ringBuffer.isEmpty() || totalFramesWritten <= 0L || anchorWriteTimeNs == Long.MIN_VALUE) {
+            return@synchronized null
+        }
+        longArrayOf(anchorWriteTimeNs, sampleRate.toLong(), channelCount.toLong(), streamGeneration)
     }
 
-    override fun readHistoryChunks(
-        maxDurationMs: Long,
-        chunkMs: Int,
-        consumer: (pcm: ShortArray, frameCount: Int, channels: Int, sampleRate: Int, startTimeNs: Long) -> Unit
-    ) {
-        val sr: Int
-        val ch: Int
-        val endFrame: Long
-        val startFrame: Long
-        val anchorNs: Long
+    override fun getOldestFrameIndex(): Long = synchronized(ringLock) {
+        if (ringBuffer.isEmpty() || totalFramesWritten <= 0L) return@synchronized 0L
+        val cap = capacityFrames.toLong()
+        max(0L, totalFramesWritten - cap + (sampleRate / 4).toLong())
+    }
 
+    override fun getCurrentWriteFrameIndex(): Long = synchronized(ringLock) {
+        totalFramesWritten
+    }
+
+    override fun getOutputLatencyNs(): Long = sinkLatencyNs
+
+    override fun readFramesAt(startFrame: Long, dest: ShortArray, frameCount: Int): Int {
+        if (frameCount <= 0) return 0
         synchronized(ringLock) {
-            if (ringBuffer.isEmpty() || totalFramesWritten <= 0L || anchorZeroDelayNs == Long.MIN_VALUE) {
-                return
-            }
-            sr = sampleRate
-            ch = channelCount
-            endFrame = totalFramesWritten
+            if (ringBuffer.isEmpty() || totalFramesWritten <= 0L || channelCount <= 0) return 0
             val cap = capacityFrames.toLong()
-            val maxFrames = (maxDurationMs * sr.toLong()) / 1000L
-            val oldestInRing = max(0L, endFrame - cap + (sr / 4).toLong())
-            startFrame = max(oldestInRing, endFrame - maxFrames)
-            anchorNs = anchorZeroDelayNs
-        }
+            val oldest = max(0L, totalFramesWritten - cap)
+            val actualStart = max(startFrame, oldest)
+            if (actualStart >= totalFramesWritten) return 0
 
-        if (startFrame >= endFrame) return
+            val maxByDest = dest.size / channelCount
+            val available = (totalFramesWritten - actualStart).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            val count = min(frameCount, min(maxByDest, available))
+            if (count <= 0) return 0
 
-        val chunkFrames = max(1, (sr * chunkMs) / 1000)
-        val chunkBuf = ShortArray(chunkFrames * ch)
-        var cursor = startFrame
-
-        while (cursor < endFrame) {
-            val count = min(chunkFrames.toLong(), endFrame - cursor).toInt()
-            var copied = 0
-            synchronized(ringLock) {
-                if (ringBuffer.isEmpty() || sr != sampleRate || ch != channelCount) return
-                val cap = capacityFrames.toLong()
-                val oldestNow = max(0L, totalFramesWritten - cap)
-                if (cursor < oldestNow) {
-                    cursor = oldestNow
-                }
-                val safeCount = min(count.toLong(), totalFramesWritten - cursor).toInt()
-                if (safeCount > 0) {
-                    for (f in 0 until safeCount) {
-                        val slot = ((cursor + f) % cap).toInt()
-                        val srcBase = slot * ch
-                        val dstBase = f * ch
-                        for (c in 0 until ch) {
-                            chunkBuf[dstBase + c] = ringBuffer[srcBase + c]
-                        }
-                    }
-                    copied = safeCount
+            for (f in 0 until count) {
+                val slot = ((actualStart + f) % cap).toInt()
+                val srcBase = slot * channelCount
+                val dstBase = f * channelCount
+                for (c in 0 until channelCount) {
+                    dest[dstBase + c] = ringBuffer[srcBase + c]
                 }
             }
-            if (copied > 0) {
-                val startTimeNs = anchorNs + (cursor * NANOS_PER_SEC) / sr.toLong()
-                consumer(chunkBuf, copied, ch, sr, startTimeNs)
-                cursor += copied.toLong()
-            } else {
-                break
-            }
+            return count
         }
     }
 
@@ -785,7 +770,7 @@ class ServiceRestartReceiver : BroadcastReceiver() {
 /**
  * Dedicated background mediaPlayback Foreground Service hosting ExoPlayer (direct HTTP/HTTPS/HLS
  * first, ICY relay fallback only on invalid HTTP/ICY header errors), 180s PCM delay ring buffer,
- * continuous no-timeout SyncEngine, persistent Arabic notification, and FloatingOverlayController.
+ * exact Lu0/H0+G0+I0+h0 SyncEngine, persistent Arabic notification, and FloatingOverlayController.
  */
 @OptIn(UnstableApi::class)
 class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
@@ -909,7 +894,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         streamRelay = StreamRelay { bytes ->
             bytesInCurrentWindow.addAndGet(bytes.toLong())
         }
-        syncEngine = SyncEngine(delayProcessor, this)
+        syncEngine = SyncEngine(applicationContext, delayProcessor, this)
         overlayController = FloatingOverlayController(this, this)
 
         initLocks()
@@ -1083,6 +1068,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
     fun setMuted(muted: Boolean) {
         isMuted = muted
+        delayProcessor.setOutputMuted(muted)
         player?.volume = if (muted) 0f else 1f
         updateState { it.copy(isMuted = muted) }
         updateNotification()
@@ -1117,7 +1103,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         val target = currentTarget
         if (target == null || !(uiState.isPlaying || uiState.isBuffering)) {
             updateState {
-                it.copy(lastSyncBannerText = "شغّل محطة إذاعية أولاً قبل بدء المزامنة التلقائية.")
+                it.copy(lastSyncBannerText = "شغّل الصوتية أولاً ثم اضغط قياس")
             }
             return false
         }
@@ -1136,11 +1122,13 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                 syncMicLevel = 0f,
                 syncHasCandidate = false,
                 syncCandidateSec = null,
-                syncStatusText = "جاري تجهيز البصمة الصوتية والاستماع للتلفزيون…",
+                syncStatusText = "قرّب الموبايل من سماعة التلفزيون… الصوتية تنكتم لحظات",
                 lastSyncBannerText = ""
             )
         }
-        syncEngine.start()
+        // Brief wait when auto-muting so ExoPlayer's AudioTrack volume=0f takes effect before mic opens
+        val drainWaitMs = if (autoMutedBySync) 180L else 0L
+        syncEngine.start(muteDrainWaitMs = drainWaitMs)
         return true
     }
 
@@ -1226,7 +1214,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             it.copy(
                 isSyncing = true,
                 syncElapsedSec = 0,
-                syncStatusText = "جاري الاستماع لصوت التلفزيون والمطابقة… (0 ث)"
+                syncStatusText = "قرّب الموبايل من سماعة التلفزيون… الصوتية تنكتم لحظات"
             )
         }
     }
@@ -1253,11 +1241,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     }
 
     override fun onCandidateDetected(candidateLagSec: Double, peakZ: Double, marginZ: Double) {
-        val msg = String.format(
-            Locale.US,
-            "تم رصد مرشّح %.1f ث • يتأكد على صوت جديد…",
-            candidateLagSec
-        )
+        val msg = String.format(Locale.US, "مرشح %.1f ث • يتأكد…", candidateLagSec)
         updateState {
             it.copy(
                 syncHasCandidate = true,
@@ -1267,9 +1251,9 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         }
     }
 
-    override fun onSyncConfirmed(measuredLagSec: Double, peakZ: Double, overlapSec: Double) {
+    override fun onSyncConfirmed(effectiveLagMs: Double, peakZ: Double, overlapSec: Double) {
         restoreAudioAfterSync(forceUnmute = true)
-        applyMeasuredSyncLag(measuredLagSec)
+        applyMeasuredSyncLag(effectiveLagMs)
     }
 
     override fun onSyncCancelled() {
@@ -1342,30 +1326,47 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
     // === Internal Engine Helpers ===
 
-    private fun applyMeasuredSyncLag(measuredLagSec: Double) {
+    /**
+     * Exact translation of LG/l lines 204-360:
+     * - effectiveLagMs <= 20.0 -> TV is behind radio; delay radio by round(-effectiveLagMs) ms (+ calibration trim).
+     * - effectiveLagMs > 20.0  -> Radio is behind TV; inform user how many seconds to delay TV/receiver picture.
+     */
+    private fun applyMeasuredSyncLag(effectiveLagMs: Double) {
         val trimSec = prefs.getCalibrationTrimSec()
-        val combined = measuredLagSec + trimSec
+        val combinedMs = effectiveLagMs - (trimSec * 1000.0)
         val banner: String
-        val appliedDelay: Double
+        val appliedDelaySec: Double
 
-        if (combined < 0.0) {
-            appliedDelay = 0.0
-            banner = String.format(
-                Locale.US,
-                "البث الإذاعي متأخر أصلاً عن التلفزيون بـ %.2f ث، لذلك تم ضبط التأخير على 0.00 ث.",
-                abs(combined)
-            )
+        if (combinedMs <= 20.0) {
+            val rawDelayMs = max(0L, (-combinedMs).roundToLong())
+            appliedDelaySec = (rawDelayMs.toDouble() / 1000.0).coerceIn(0.0, FootSyncPrefs.MAX_DELAY_SEC)
+            banner = if (abs(trimSec) >= 0.005) {
+                String.format(
+                    Locale.US,
+                    "تمت المزامنة ✓ • تأخير الصوتية %.2f ث (معايرة %+.2f ث)",
+                    appliedDelaySec,
+                    trimSec
+                )
+            } else {
+                String.format(
+                    Locale.US,
+                    "تمت المزامنة ✓ • تأخير الصوتية %.2f ث",
+                    appliedDelaySec
+                )
+            }
+            setDelaySeconds(appliedDelaySec, persistForUrl = true)
         } else {
-            appliedDelay = combined.coerceIn(0.0, FootSyncPrefs.MAX_DELAY_SEC)
+            val lateSec = combinedMs / 1000.0
+            val suggestedReceiverDelaySec = ceil(combinedMs / 500.0) * 0.5
             banner = String.format(
                 Locale.US,
-                "تمت المزامنة بنجاح ✓ التأخير المضبوط: %.2f ث (معايرة %+.2f ث).",
-                appliedDelay,
-                trimSec
+                "الصوتية متأخرة %.1f ث عن الصورة • أخّر صورة الرسيفر %.1f ث من قائمته ثم اضغط قياس مرة ثانية",
+                lateSec,
+                suggestedReceiverDelaySec
             )
+            setDelaySeconds(0.0, persistForUrl = true)
         }
 
-        setDelaySeconds(appliedDelay, persistForUrl = true)
         updateState {
             it.copy(
                 isSyncing = false,
@@ -1435,6 +1436,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             .build()
 
         exo.setAudioAttributes(audioAttributes, false)
+        delayProcessor.setOutputMuted(isMuted)
         exo.volume = if (isMuted) 0f else 1f
 
         exo.addListener(object : Player.Listener {
@@ -1571,6 +1573,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             exo.setMediaItem(MediaItem.fromUri(playableUrl))
             exo.prepare()
             exo.playWhenReady = true
+            delayProcessor.setOutputMuted(isMuted)
             exo.volume = if (isMuted) 0f else 1f
         } catch (_: Throwable) {
             scheduleAutoReconnect("فشل بدء التشغيل • إعادة المحاولة…")
