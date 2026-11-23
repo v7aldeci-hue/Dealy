@@ -1,13 +1,22 @@
 package com.footsync.radio
 
 import android.Manifest
+import android.animation.ValueAnimator
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RadialGradient
+import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -23,9 +32,17 @@ import android.text.InputType
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.VelocityTracker
 import android.view.View
+import android.view.ViewConfiguration
+import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
+import android.view.animation.OvershootInterpolator
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -34,20 +51,26 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /**
- * Portrait-first dark Arabic RTL smartphone interface for FootSync Radio.
- * Connects to [RadioPlaybackService] for persistent playback, 180s PCM delay control,
- * on-demand 40-band spectral auto-sync, 2-tap manual stopwatch sync, multi-format library
- * management, and optional touch floating overlay.
+ * 3-page dark Shazam-styled smartphone UI for FootSync Radio:
+ * - Page 0 (Left, Marked "3"): Libraries 2-column card grid + in-page sequential channel browser.
+ * - Page 1 (Center, Marked "1", Default Home): Hero pulsing circular Auto-Sync screen + quick controls.
+ * - Page 2 (Right, Marked "2"): Delay & Controls (dashed direct numeric input, seekbar, step grid,
+ *   2-tap stopwatch, earphone toggle, timeout selector, speaker/Bluetooth calibration trim).
  */
 class MainActivity : AppCompatActivity() {
 
@@ -61,6 +84,7 @@ class MainActivity : AppCompatActivity() {
     private var isServiceBound = false
     private var latestState = ServiceUiState()
     private var selectedLibraryId: String = LibraryManager.MANUAL_LIBRARY_ID
+    private var browsingLibraryId: String? = null
     private var userDraggingSeekBar = false
     private var pendingAutoSyncAfterPermission = false
     private var pendingOverlayAfterPermission = false
@@ -73,48 +97,56 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             if (!stopwatchActive) return
             val elapsedSec = (SystemClock.elapsedRealtime() - stopwatchStartMs).toDouble() / 1000.0
-            btnTwoTapSync.text = String.format(
-                Locale.US,
-                "اضغط عند مطابقة الصوت (%.2f ث)",
-                elapsedSec
-            )
+            tvStopwatchDisplay.text = String.format(Locale.US, "%.2f ث", elapsedSec)
+            btnTwoTapSync.text = "اضغط عند مطابقة الصوت"
             uiHandler.postDelayed(this, 33L)
         }
     }
 
-    // UI References
-    private lateinit var tvStationTitle: TextView
-    private lateinit var tvStationMeta: TextView
-    private lateinit var tvConnectionBadge: TextView
-    private lateinit var tvSpeedAndBuffer: TextView
-    private lateinit var btnFloatingOverlay: TextView
+    // Outer 3-page horizontal snap pager (index 0 = Left Page 3, index 1 = Center Page 1, index 2 = Right Page 2)
+    private lateinit var pager: SnapHorizontalPager
 
+    // === Page 1 (Center — Home) UI references ===
+    private lateinit var tvHomePrompt: TextView
+    private lateinit var tvHomeStationPill: TextView
+    private lateinit var tvHomeDelayPill: TextView
+    private lateinit var homeStatusDot: View
+    private lateinit var pulseRingView: PulseRingView
+    private lateinit var heroCircleButton: FrameLayout
+    private lateinit var heroEmblemView: VectorIconView
+    private lateinit var tvHomeSyncSubtext: TextView
+    private lateinit var btnHomePlayPause: FrameLayout
+    private lateinit var icHomePlayPause: VectorIconView
+    private lateinit var lblHomePlayPause: TextView
+    private lateinit var btnHomeMute: FrameLayout
+    private lateinit var icHomeMute: VectorIconView
+    private lateinit var lblHomeMute: TextView
+    private lateinit var btnHomeOverlay: FrameLayout
+    private lateinit var icHomeOverlay: VectorIconView
+    private lateinit var tvHomeBanner: TextView
+    private lateinit var btnHomeApplyCandidate: TextView
+
+    // === Page 2 (Right — Delay & Controls) UI references ===
     private lateinit var tvDelayReadout: TextView
+    private lateinit var tvDelayBufferInfo: TextView
+    private lateinit var etDirectDelay: EditText
     private lateinit var seekDelay: SeekBar
-    private lateinit var btnAutoSync: TextView
+    private lateinit var tvStopwatchDisplay: TextView
     private lateinit var btnTwoTapSync: TextView
-    private lateinit var syncProgressContainer: LinearLayout
-    private lateinit var pbMicLevel: ProgressBar
-    private lateinit var tvSyncLiveStatus: TextView
-    private lateinit var tvSyncBanner: TextView
-    private lateinit var btnApplyCandidate: TextView
-
+    private lateinit var swEarphoneNoMute: Switch
     private lateinit var btnTimeout45: TextView
     private lateinit var btnTimeout60: TextView
     private lateinit var btnTimeout80: TextView
-    private lateinit var swEarphoneNoMute: Switch
-
-    private lateinit var btnPrev: TextView
-    private lateinit var btnPlayPause: TextView
-    private lateinit var btnNext: TextView
-    private lateinit var btnMute: TextView
-    private lateinit var btnResetDelay: TextView
-
     private lateinit var tvCalibrationValue: TextView
 
-    private lateinit var libraryChipsContainer: LinearLayout
-    private lateinit var tvLibraryHeaderCount: TextView
-    private lateinit var btnManageActiveLibrary: TextView
+    // === Page 3 (Left — Libraries & In-Page Channels) UI references ===
+    private lateinit var tvLibrariesSubtitle: TextView
+    private lateinit var librariesGridScroll: ScrollView
+    private lateinit var librariesGridContainer: LinearLayout
+    private lateinit var channelBrowserContainer: LinearLayout
+    private lateinit var tvChannelBrowserTitle: TextView
+    private lateinit var tvChannelBrowserCount: TextView
+    private lateinit var btnChannelBrowserManage: TextView
     private lateinit var channelsListContainer: LinearLayout
 
     private val stateListener: (ServiceUiState) -> Unit = { state ->
@@ -185,18 +217,39 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        window.statusBarColor = COLOR_BG
-        window.navigationBarColor = COLOR_BG
+        window.statusBarColor = COLOR_HOME_BG
+        window.navigationBarColor = COLOR_HOME_BG
 
         libraryManager = LibraryManager(this)
         prefs = FootSyncPrefs(this)
         selectedLibraryId = libraryManager.getActiveLibrary().id
 
-        setContentView(buildRootLayout())
-        refreshLibraryUi()
+        setContentView(buildRootPagerLayout())
+
+        refreshLibrariesPageUi()
         refreshTimeoutPills()
         refreshCalibrationReadout()
         requestNotificationPermissionIfNeeded()
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    pager.currentPage == PAGE_LIBRARIES && browsingLibraryId != null -> {
+                        browsingLibraryId = null
+                        refreshLibrariesPageUi()
+                    }
+
+                    pager.currentPage != PAGE_HOME -> {
+                        pager.scrollToPage(PAGE_HOME, animated = true)
+                    }
+
+                    else -> {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
+                }
+            }
+        })
 
         val svcIntent = Intent(this, RadioPlaybackService::class.java)
         bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -209,15 +262,18 @@ class MainActivity : AppCompatActivity() {
             bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
         }
         playbackService?.addStateListener(stateListener)
+        pulseRingView.resumeAnimation()
     }
 
     override fun onStop() {
+        pulseRingView.pauseAnimation()
         playbackService?.removeStateListener(stateListener)
         super.onStop()
     }
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(stopwatchTicker)
+        pulseRingView.pauseAnimation()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (isServiceBound) {
             playbackService?.removeStateListener(stateListener)
@@ -231,329 +287,660 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    // === UI Construction ===
+    // =========================================================================
+    // 3-PAGE HORIZONTAL SNAP PAGER ROOT (LTR outer order: Left=3, Center=1, Right=2)
+    // =========================================================================
 
-    private fun buildRootLayout(): View {
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(COLOR_BG)
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            isFillViewport = true
-            overScrollMode = View.OVER_SCROLL_ALWAYS
+    private fun buildRootPagerLayout(): View {
+        val pageLeftLibraries = buildPage3Libraries()
+        val pageCenterHome = buildPage1CenterHome()
+        val pageRightDelay = buildPage2DelayControls()
+
+        pager = SnapHorizontalPager(this).apply {
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setPages(
+                listOf(pageLeftLibraries, pageCenterHome, pageRightDelay),
+                initialPage = PAGE_HOME
+            )
+            onPageChanged = { pageIdx ->
+                val barColor = if (pageIdx == PAGE_HOME) COLOR_HOME_BG else COLOR_DARK_SURFACE_BG
+                window.statusBarColor = barColor
+                window.navigationBarColor = barColor
+                if (pageIdx != PAGE_DELAY) {
+                    hideKeyboard()
+                }
+            }
+        }
+        return pager
+    }
+
+    // =========================================================================
+    // PAGE 1 (CENTER — Default Home Screen, Marked "1")
+    // =========================================================================
+
+    private fun buildPage1CenterHome(): View {
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            setBackgroundColor(COLOR_HOME_BG)
+            setPadding(dp(18), dp(14), dp(18), dp(22))
         }
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(14), dp(14), dp(14), dp(28))
+        // Top Navigation Bar (LTR): Left = المكتبات, Center = • • •, Right = التأخير
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
         }
 
-        root.addView(buildHeaderStatusCard())
-        root.addView(spaceVertical(12))
-        root.addView(buildSyncAndDelayCard())
-        root.addView(spaceVertical(12))
-        root.addView(buildCalibrationCard())
-        root.addView(spaceVertical(12))
-        root.addView(buildLibrariesAndChannelsCard())
+        val leftNavBtn = buildTopNavTab(IconType.LIBRARY, "المكتبات") {
+            pager.scrollToPage(PAGE_LIBRARIES, animated = true)
+        }
 
-        scroll.addView(root)
-        return scroll
-    }
+        val centerDotsHolder = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addView(
+                buildPaginationDots(activeIndex = 1),
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER
+                )
+            )
+        }
 
-    private fun buildHeaderStatusCard(): LinearLayout {
-        val card = makeCard()
+        val rightNavBtn = buildTopNavTab(IconType.DELAY, "التأخير") {
+            pager.scrollToPage(PAGE_DELAY, animated = true)
+        }
 
-        // Top Bar: Brand + Floating Overlay button
-        val topRow = LinearLayout(this).apply {
+        topBar.addView(leftNavBtn)
+        topBar.addView(centerDotsHolder)
+        topBar.addView(rightNavBtn)
+
+        // Center Hero Column (Prompt + Active Station Pill + 184dp Pulsing Sync Circle)
+        val centerArea = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        centerArea.addView(spaceWeight(0.42f))
+
+        // Header Prompt: Headphone vector icon + bold white "اضغط للمزامنة"
+        val promptRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER
             layoutParams = matchWrap()
         }
 
-        val titleCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        val headphoneIcon = VectorIconView(this, IconType.HEADPHONES, Color.WHITE).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(22), dp(22)).apply {
+                marginEnd = dp(8)
+            }
         }
 
-        val appLabel = TextView(this).apply {
-            text = "FootSync Radio"
-            setTextColor(COLOR_ACCENT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+        tvHomePrompt = TextView(this).apply {
+            text = "اضغط للمزامنة"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 21f)
             typeface = Typeface.DEFAULT_BOLD
-        }
-
-        tvStationTitle = TextView(this).apply {
-            text = "اختر محطة تعليق للبدء"
-            setTextColor(COLOR_TEXT_PRIMARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
         }
 
-        tvStationMeta = TextView(this).apply {
-            text = "جاهز للتشغيل والمزامنة عبر الميكروفون"
-            setTextColor(COLOR_TEXT_SECONDARY)
+        promptRow.addView(headphoneIcon)
+        promptRow.addView(tvHomePrompt)
+        centerArea.addView(promptRow)
+
+        // Subtle Pill showing Active Station Name + Live Delay
+        val stationPill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            background = roundedDrawable(
+                fillColor = Color.parseColor("#18202C"),
+                strokeColor = Color.parseColor("#2B3545"),
+                strokeWidthPx = dp(1),
+                radiusPx = dp(20).toFloat()
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(12)
+            }
+            setOnClickListener { pager.scrollToPage(PAGE_LIBRARIES, animated = true) }
+        }
+        applySpringTouch(stationPill)
+
+        homeStatusDot = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply {
+                marginEnd = dp(8)
+            }
+            background = roundedDrawable(COLOR_TEXT_MUTED, Color.TRANSPARENT, 0, dp(4).toFloat())
+        }
+
+        tvHomeStationPill = TextView(this).apply {
+            text = "اختر محطة تعليق"
+            setTextColor(COLOR_TEXT_PRIMARY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
+            maxWidth = dp(175)
         }
 
-        titleCol.addView(appLabel)
-        titleCol.addView(tvStationTitle)
-        titleCol.addView(tvStationMeta)
-
-        btnFloatingOverlay = makePillButton(
-            text = "نافذة عائمة",
-            bgColor = COLOR_SURFACE_ELEVATED,
-            textColor = COLOR_SKY,
-            strokeColor = COLOR_SKY_BORDER,
-            heightDp = 40
-        ).apply {
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                dp(40)
-            ).apply {
-                marginStart = dp(8)
-            }
-            setOnClickListener { handleFloatingOverlayClick() }
+        val pillDivider = TextView(this).apply {
+            text = "  •  "
+            setTextColor(COLOR_TEXT_MUTED)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
         }
 
-        topRow.addView(titleCol)
-        topRow.addView(btnFloatingOverlay)
-
-        // Status & Live Telemetry Row
-        val statusRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = matchWrap().apply { topMargin = dp(10) }
-        }
-
-        tvConnectionBadge = TextView(this).apply {
-            text = "متوقف"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            background = roundedDrawable(COLOR_SURFACE_ELEVATED, Color.TRANSPARENT, 0, dp(20).toFloat())
-        }
-
-        tvSpeedAndBuffer = TextView(this).apply {
-            text = "السرعة: 0.0 KB/s • الذاكرة: 0 ث"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            gravity = Gravity.END
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(8)
-            }
-        }
-
-        statusRow.addView(tvConnectionBadge)
-        statusRow.addView(tvSpeedAndBuffer)
-
-        card.addView(topRow)
-        card.addView(statusRow)
-        return card
-    }
-
-    private fun buildSyncAndDelayCard(): LinearLayout {
-        val card = makeCard()
-
-        val delayLabel = TextView(this).apply {
-            text = "التأخير الصوتي الحالي"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            gravity = Gravity.CENTER
-            layoutParams = matchWrap()
-        }
-
-        tvDelayReadout = TextView(this).apply {
+        tvHomeDelayPill = TextView(this).apply {
             text = "0.00 ث"
-            setTextColor(COLOR_ACCENT)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 38f)
+            setTextColor(COLOR_SHAZAM_BLUE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            gravity = Gravity.CENTER
-            layoutParams = matchWrap().apply { topMargin = dp(2) }
         }
 
-        // Primary Auto-Sync + 2-Tap Stopwatch buttons
-        val syncButtonsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = matchWrap().apply { topMargin = dp(12) }
+        stationPill.addView(homeStatusDot)
+        stationPill.addView(tvHomeStationPill)
+        stationPill.addView(pillDivider)
+        stationPill.addView(tvHomeDelayPill)
+        centerArea.addView(stationPill)
+
+        // Hero Circular Sync Button (184dp x 184dp) centered over Shazam PulseRingView
+        val heroStage = FrameLayout(this).apply {
+            clipChildren = false
+            clipToPadding = false
+            layoutParams = LinearLayout.LayoutParams(dp(300), dp(300)).apply {
+                topMargin = dp(8)
+            }
         }
 
-        btnAutoSync = makePillButton(
-            text = "زامن",
-            bgColor = COLOR_ACCENT_DARK,
-            textColor = COLOR_TEXT_ON_ACCENT,
-            heightDp = 50,
-            textSizeSp = 16f
-        ).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(50), 1.1f)
+        pulseRingView = PulseRingView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER
+            )
+        }
+
+        heroCircleButton = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(184), dp(184), Gravity.CENTER)
+            background = buildHeroCircleDrawable(isListening = false)
+            elevation = dp(12).toFloat()
             setOnClickListener { handleAutoSyncClick() }
         }
+        applySpringTouch(heroCircleButton)
 
-        btnTwoTapSync = makePillButton(
-            text = "مزامنة بضغطتين",
-            bgColor = COLOR_SURFACE_ELEVATED,
-            textColor = COLOR_TEXT_PRIMARY,
-            strokeColor = COLOR_BORDER,
-            heightDp = 50,
-            textSizeSp = 13.5f
-        ).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(50), 1f).apply {
-                marginStart = dp(8)
-            }
-            setOnClickListener { handleTwoTapStopwatchClick() }
+        heroEmblemView = VectorIconView(this, IconType.SHAZAM_SYNC, Color.WHITE).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(102), dp(102), Gravity.CENTER)
         }
+        heroCircleButton.addView(heroEmblemView)
 
-        syncButtonsRow.addView(btnAutoSync)
-        syncButtonsRow.addView(btnTwoTapSync)
+        pulseRingView.attachTargetCircle(heroCircleButton)
 
-        // Live Auto-Sync Progress Box (shown only while measuring)
-        syncProgressContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundedDrawable(COLOR_SYNC_BOX_BG, COLOR_WARNING, dp(1), dp(12).toFloat())
-            layoutParams = matchWrap().apply { topMargin = dp(10) }
-        }
+        heroStage.addView(pulseRingView)
+        heroStage.addView(heroCircleButton)
+        centerArea.addView(heroStage)
 
-        tvSyncLiveStatus = TextView(this).apply {
-            setTextColor(COLOR_WARNING)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            layoutParams = matchWrap()
-        }
-
-        val micRowLabel = TextView(this).apply {
-            text = "مستوى صوت التلفزيون بالميكروفون"
+        // Live subtle sync feedback line under the circle
+        tvHomeSyncSubtext = TextView(this).apply {
+            text = ""
             setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            layoutParams = matchWrap().apply { topMargin = dp(6) }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            gravity = Gravity.CENTER
+            visibility = View.INVISIBLE
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            layoutParams = matchWrap().apply { topMargin = dp(2) }
         }
+        centerArea.addView(tvHomeSyncSubtext)
 
-        pbMicLevel = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            progress = 0
-            progressTintList = ColorStateList.valueOf(COLOR_ACCENT)
-            progressBackgroundTintList = ColorStateList.valueOf(COLOR_SURFACE_ELEVATED)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(8)
-            ).apply { topMargin = dp(4) }
-        }
-
-        syncProgressContainer.addView(tvSyncLiveStatus)
-        syncProgressContainer.addView(micRowLabel)
-        syncProgressContainer.addView(pbMicLevel)
-
-        // Sync result/info banner + optional unconfirmed candidate apply button
-        tvSyncBanner = TextView(this).apply {
+        // Sync result banner + Unconfirmed Candidate Manual Apply Button (when timeout occurs)
+        tvHomeBanner = TextView(this).apply {
             visibility = View.GONE
             setTextColor(COLOR_TEXT_PRIMARY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setPadding(dp(12), dp(9), dp(12), dp(9))
-            background = roundedDrawable(COLOR_SURFACE_ELEVATED, COLOR_BORDER, dp(1), dp(10).toFloat())
-            layoutParams = matchWrap().apply { topMargin = dp(10) }
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            background = roundedDrawable(
+                Color.parseColor("#182130"),
+                Color.parseColor("#2B3B52"),
+                dp(1),
+                dp(12).toFloat()
+            )
+            layoutParams = matchWrap().apply { topMargin = dp(6) }
         }
+        centerArea.addView(tvHomeBanner)
 
-        btnApplyCandidate = makePillButton(
-            text = "تطبيق المرشّح",
-            bgColor = COLOR_WARNING_SOFT,
-            textColor = COLOR_WARNING,
-            strokeColor = COLOR_WARNING,
-            heightDp = 42
-        ).apply {
+        btnHomeApplyCandidate = TextView(this).apply {
             visibility = View.GONE
-            layoutParams = matchWrap().apply { topMargin = dp(8) }
+            text = "تطبيق المرشّح"
+            setTextColor(COLOR_WARNING)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(18), dp(10), dp(18), dp(10))
+            background = rippleButtonDrawable(
+                COLOR_WARNING_SOFT,
+                COLOR_WARNING,
+                dp(22).toFloat()
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8)
+            }
             setOnClickListener {
                 val cand = latestState.unconfirmedCandidateSec ?: return@setOnClickListener
                 playbackService?.applyUnconfirmedCandidate(cand)
             }
         }
+        applySpringTouch(btnHomeApplyCandidate)
+        centerArea.addView(btnHomeApplyCandidate)
 
-        // Sync Options Row: Timeout Selector (45 / 60 / 80s) + Earphone No-Mute Toggle
-        val syncOptionsRow = LinearLayout(this).apply {
+        centerArea.addView(spaceWeight(0.58f))
+
+        // Bottom Quick Controls Row (subtle dark circular buttons #232830 matching screenshot #1 bottom)
+        val bottomRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = matchWrap().apply { topMargin = dp(12) }
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER
+            layoutParams = matchWrap().apply { bottomMargin = dp(4) }
         }
 
-        val timeoutLabel = TextView(this).apply {
-            text = "مهلة البحث:"
-            setTextColor(COLOR_TEXT_SECONDARY)
+        val (prevCol, _, _) = buildHomeCircleAction(IconType.PREV, "السابق", sizeDp = 48) {
+            ensureServiceStarted()
+            val stepped = playbackService?.stepChannel(-1)
+            if (stepped == null) toast("لا توجد قنوات في المكتبة النشطة.")
+        }
+
+        val (playCol, playCircle, playIcon, playLabel) = buildHomeCircleActionWithRefs(
+            IconType.PLAY,
+            "تشغيل",
+            sizeDp = 56
+        ) {
+            ensureServiceStarted()
+            playbackService?.togglePlayPause()
+        }
+        btnHomePlayPause = playCircle
+        icHomePlayPause = playIcon
+        lblHomePlayPause = playLabel
+
+        val (nextCol, _, _) = buildHomeCircleAction(IconType.NEXT, "التالي", sizeDp = 48) {
+            ensureServiceStarted()
+            val stepped = playbackService?.stepChannel(+1)
+            if (stepped == null) toast("لا توجد قنوات في المكتبة النشطة.")
+        }
+
+        val (muteCol, muteCircle, muteIcon, muteLabel) = buildHomeCircleActionWithRefs(
+            IconType.UNMUTE,
+            "كتم",
+            sizeDp = 48
+        ) {
+            playbackService?.toggleMute()
+        }
+        btnHomeMute = muteCircle
+        icHomeMute = muteIcon
+        lblHomeMute = muteLabel
+
+        val (overlayCol, overlayCircle, overlayIcon, _) = buildHomeCircleActionWithRefs(
+            IconType.OVERLAY,
+            "عائمة",
+            sizeDp = 48
+        ) {
+            handleFloatingOverlayClick()
+        }
+        btnHomeOverlay = overlayCircle
+        icHomeOverlay = overlayIcon
+
+        bottomRow.addView(prevCol)
+        bottomRow.addView(playCol)
+        bottomRow.addView(nextCol)
+        bottomRow.addView(muteCol)
+        bottomRow.addView(overlayCol)
+
+        page.addView(topBar)
+        page.addView(centerArea)
+        page.addView(bottomRow)
+        return page
+    }
+
+    private fun buildTopNavTab(iconType: IconType, label: String, onClick: () -> Unit): LinearLayout {
+        val tab = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener { onClick() }
+        }
+        applySpringTouch(tab)
+
+        val icon = VectorIconView(this, iconType, Color.WHITE).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(24))
+        }
+        val text = TextView(this).apply {
+            this.text = label
+            setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { marginEnd = dp(6) }
+            ).apply { topMargin = dp(4) }
         }
+        tab.addView(icon)
+        tab.addView(text)
+        return tab
+    }
 
-        btnTimeout45 = makeSmallOptionChip("45 ث") {
-            prefs.setSyncTimeoutSec(45)
-            refreshTimeoutPills()
-        }
-        btnTimeout60 = makeSmallOptionChip("60 ث") {
-            prefs.setSyncTimeoutSec(60)
-            refreshTimeoutPills()
-        }
-        btnTimeout80 = makeSmallOptionChip("80 ث") {
-            prefs.setSyncTimeoutSec(80)
-            refreshTimeoutPills()
-        }
+    private data class CircleActionBundle(
+        val column: LinearLayout,
+        val circle: FrameLayout,
+        val icon: VectorIconView,
+        val label: TextView
+    )
 
-        syncOptionsRow.addView(timeoutLabel)
-        syncOptionsRow.addView(btnTimeout45)
-        syncOptionsRow.addView(spaceHorizontal(5))
-        syncOptionsRow.addView(btnTimeout60)
-        syncOptionsRow.addView(spaceHorizontal(5))
-        syncOptionsRow.addView(btnTimeout80)
+    private fun buildHomeCircleAction(
+        iconType: IconType,
+        label: String,
+        sizeDp: Int,
+        onClick: () -> Unit
+    ): Triple<LinearLayout, FrameLayout, VectorIconView> {
+        val bundle = buildHomeCircleActionWithRefs(iconType, label, sizeDp, onClick)
+        return Triple(bundle.column, bundle.circle, bundle.icon)
+    }
 
-        val earphoneRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = matchWrap().apply { topMargin = dp(8) }
-        }
-
-        val earphoneLabel = TextView(this).apply {
-            text = "سماعة أذن (بدون كتم أثناء المزامنة)"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+    private fun buildHomeCircleActionWithRefs(
+        iconType: IconType,
+        label: String,
+        sizeDp: Int,
+        onClick: () -> Unit
+    ): CircleActionBundle {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        swEarphoneNoMute = Switch(this).apply {
-            isChecked = prefs.isEarphoneNoMuteEnabled()
-            setOnCheckedChangeListener { _, isChecked ->
-                prefs.setEarphoneNoMuteEnabled(isChecked)
+        val circle = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+            background = rippleButtonDrawable(
+                fillColor = COLOR_HOME_CIRCLE_BTN,
+                strokeColor = Color.parseColor("#2E3540"),
+                radiusPx = dp(sizeDp / 2).toFloat()
+            )
+            setOnClickListener { onClick() }
+        }
+        applySpringTouch(circle)
+
+        val icon = VectorIconView(this, iconType, Color.WHITE).apply {
+            val iconPx = dp((sizeDp * 0.44f).roundToInt())
+            layoutParams = FrameLayout.LayoutParams(iconPx, iconPx, Gravity.CENTER)
+        }
+        circle.addView(icon)
+
+        val lbl = TextView(this).apply {
+            text = label
+            setTextColor(COLOR_TEXT_SECONDARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER
+            maxLines = 1
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+        }
+
+        col.addView(circle)
+        col.addView(lbl)
+        return CircleActionBundle(col, circle, icon, lbl)
+    }
+
+    private fun buildHeroCircleDrawable(isListening: Boolean): RippleDrawable {
+        val fill = if (isListening) COLOR_SHAZAM_BLUE else COLOR_HERO_IDLE
+        val stroke = if (isListening) Color.parseColor("#66C2E8FF") else Color.parseColor("#22FFFFFF")
+        return rippleButtonDrawable(fill, stroke, dp(92).toFloat())
+    }
+
+    // =========================================================================
+    // PAGE 2 (RIGHT — Delay & Controls Screen, Marked "2")
+    // =========================================================================
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun buildPage2DelayControls(): View {
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            setBackgroundColor(COLOR_DARK_SURFACE_BG)
+        }
+
+        // Top Bar (LTR): Left = Back arrow to Center, Center = Title + 3 dots (3rd active), Right = Reset 0.00
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(10))
+            layoutParams = matchWrap()
+        }
+
+        val btnBack = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            background = rippleButtonDrawable(Color.TRANSPARENT, Color.TRANSPARENT, dp(20).toFloat())
+            setOnClickListener { pager.scrollToPage(PAGE_HOME, animated = true) }
+            addView(
+                VectorIconView(this@MainActivity, IconType.BACK_LEFT, Color.WHITE),
+                FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER)
+            )
+        }
+        applySpringTouch(btnBack)
+
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val tvTitle = TextView(this).apply {
+            text = "التأخير والضبط"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        val dots = buildPaginationDots(activeIndex = 2).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+        }
+        titleCol.addView(tvTitle)
+        titleCol.addView(dots)
+
+        val btnTopReset = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            background = rippleButtonDrawable(Color.TRANSPARENT, Color.TRANSPARENT, dp(20).toFloat())
+            setOnClickListener {
+                playbackService?.resetDelay()
+                toast("تم تصفير التأخير إلى 0.00 ث")
+            }
+            addView(
+                VectorIconView(this@MainActivity, IconType.RESET, Color.WHITE),
+                FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER)
+            )
+        }
+        applySpringTouch(btnTopReset)
+
+        topBar.addView(btnBack)
+        topBar.addView(titleCol)
+        topBar.addView(btnTopReset)
+
+        // Scrollable RTL Body
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_ALWAYS
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(16), dp(6), dp(16), dp(28))
+            layoutParams = matchWrap()
+        }
+
+        // Section 1 Heading
+        content.addView(makeSectionHeading("التأخير المباشر"))
+
+        // 1. Dashed-Border Delay Display & Direct Numeric Input Card (matching screenshot #2 dashed box)
+        val dashedCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(16).toFloat()
+                setColor(Color.parseColor("#181818"))
+                setStroke(
+                    dp(1.2f),
+                    Color.parseColor("#474747"),
+                    dp(7).toFloat(),
+                    dp(5).toFloat()
+                )
+            }
+            layoutParams = matchWrap().apply { topMargin = dp(10) }
+        }
+
+        tvDelayReadout = TextView(this).apply {
+            text = "0.00 ث"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 40f)
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            layoutParams = matchWrap()
+        }
+
+        tvDelayBufferInfo = TextView(this).apply {
+            text = "الذاكرة الصوتية المتاحة: 0 ث • السرعة: 0.0 KB/s"
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            gravity = Gravity.CENTER
+            layoutParams = matchWrap().apply { topMargin = dp(4) }
+        }
+
+        val directInputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = matchWrap().apply { topMargin = dp(14) }
+        }
+
+        etDirectDelay = EditText(this).apply {
+            hint = "أدخل التأخير بالثواني (مثال 12.5)"
+            setHintTextColor(Color.parseColor("#757575"))
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setSingleLine(true)
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedDrawable(
+                Color.parseColor("#252525"),
+                Color.parseColor("#383838"),
+                dp(1),
+                dp(12).toFloat()
+            )
+            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1.4f)
+        }
+
+        val btnApplyDirect = makePillButton(
+            text = "تطبيق",
+            bgColor = COLOR_ACCENT_BLUE,
+            textColor = Color.WHITE,
+            heightDp = 44,
+            textSizeSp = 13.5f
+        ).apply {
+            setPadding(dp(14), 0, dp(14), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                dp(44)
+            ).apply { marginStart = dp(8) }
+            setOnClickListener { applyDirectDelayInput() }
+        }
+
+        val btnResetDirect = makePillButton(
+            text = "تصفير",
+            bgColor = Color.parseColor("#2A2A2A"),
+            textColor = COLOR_GRAY_SUBTITLE,
+            heightDp = 44,
+            textSizeSp = 13f
+        ).apply {
+            setPadding(dp(12), 0, dp(12), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                dp(44)
+            ).apply { marginStart = dp(6) }
+            setOnClickListener {
+                etDirectDelay.setText("")
+                playbackService?.resetDelay()
+                hideKeyboard()
             }
         }
 
-        earphoneRow.addView(earphoneLabel)
-        earphoneRow.addView(swEarphoneNoMute)
+        directInputRow.addView(etDirectDelay)
+        directInputRow.addView(btnApplyDirect)
+        directInputRow.addView(btnResetDirect)
 
-        // Delay SeekBar (0..180s in 0.1s increments)
-        val seekHeader = LinearLayout(this).apply {
+        dashedCard.addView(tvDelayReadout)
+        dashedCard.addView(tvDelayBufferInfo)
+        dashedCard.addView(directInputRow)
+        content.addView(dashedCard)
+
+        // 2. Delay SeekBar Card (0..180s) + Advance / Delay Step Grid
+        content.addView(makeSectionHeading("شريط التأخير والضبط الدقيق").apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(20)
+        })
+
+        val seekCard = makePage2Card().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(10)
+        }
+
+        val seekBoundsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
-            layoutParams = matchWrap().apply { topMargin = dp(14) }
+            layoutParams = matchWrap()
         }
-        seekHeader.addView(TextView(this).apply {
+        seekBoundsRow.addView(TextView(this).apply {
             text = "0 ث"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
-        seekHeader.addView(TextView(this).apply {
+        seekBoundsRow.addView(TextView(this).apply {
             text = "180 ث (3 دقائق)"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.END
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
@@ -562,15 +949,27 @@ class MainActivity : AppCompatActivity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             max = 1800 // 0.0s .. 180.0s (0.1s resolution)
             progress = 0
-            thumbTintList = ColorStateList.valueOf(COLOR_ACCENT)
-            progressTintList = ColorStateList.valueOf(COLOR_ACCENT)
-            progressBackgroundTintList = ColorStateList.valueOf(COLOR_SURFACE_ELEVATED)
-            layoutParams = matchWrap().apply { topMargin = dp(4) }
+            thumbTintList = ColorStateList.valueOf(COLOR_ACCENT_BLUE)
+            progressTintList = ColorStateList.valueOf(COLOR_ACCENT_BLUE)
+            progressBackgroundTintList = ColorStateList.valueOf(Color.parseColor("#333333"))
+            layoutParams = matchWrap().apply { topMargin = dp(6) }
+            // Prevent horizontal pager from stealing SeekBar drag gestures
+            setOnTouchListener { v, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE ->
+                        v.parent?.requestDisallowInterceptTouchEvent(true)
+
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        v.parent?.requestDisallowInterceptTouchEvent(false)
+                }
+                false
+            }
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                     if (fromUser) {
                         val sec = progress.toDouble() / 10.0
                         tvDelayReadout.text = String.format(Locale.US, "%.2f ث", sec)
+                        tvHomeDelayPill.text = String.format(Locale.US, "%.2f ث", sec)
                         playbackService?.setDelaySeconds(sec, persistForUrl = false)
                     }
                 }
@@ -587,324 +986,709 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        // Fine-tuning pills: -10s, -1s, -0.25s, +0.25s, +1s, +10s
-        val tuneRow1 = LinearLayout(this).apply {
+        // Step Grid Row 1: -10s, -1s, -0.25s
+        val stepRowMinus = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
-            layoutParams = matchWrap().apply { topMargin = dp(10) }
+            layoutParams = matchWrap().apply { topMargin = dp(14) }
         }
-        listOf("-10 ث" to -10.0, "-1 ث" to -1.0, "-0.25 ث" to -0.25).forEachIndexed { idx, (lbl, delta) ->
-            tuneRow1.addView(
-                makePillButton(lbl, COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 40).apply {
-                    layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
-                        if (idx > 0) marginStart = dp(6)
+        listOf("-10 ث" to -10.0, "-1 ث" to -1.0, "-0.25 ث" to -0.25).forEachIndexed { i, (label, delta) ->
+            stepRowMinus.addView(
+                makePillButton(label, Color.parseColor("#2B2B2B"), Color.WHITE, heightDp = 42).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                        if (i > 0) marginStart = dp(8)
                     }
                     setOnClickListener { playbackService?.adjustDelaySeconds(delta) }
                 }
             )
         }
 
-        val tuneRow2 = LinearLayout(this).apply {
+        // Step Grid Row 2: +0.25s, +1s, +10s
+        val stepRowPlus = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
-            layoutParams = matchWrap().apply { topMargin = dp(6) }
+            layoutParams = matchWrap().apply { topMargin = dp(8) }
         }
-        listOf("+0.25 ث" to 0.25, "+1 ث" to 1.0, "+10 ث" to 10.0).forEachIndexed { idx, (lbl, delta) ->
-            tuneRow2.addView(
-                makePillButton(lbl, COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 40).apply {
-                    layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
-                        if (idx > 0) marginStart = dp(6)
+        listOf("+0.25 ث" to 0.25, "+1 ث" to 1.0, "+10 ث" to 10.0).forEachIndexed { i, (label, delta) ->
+            stepRowPlus.addView(
+                makePillButton(label, Color.parseColor("#2B2B2B"), Color.WHITE, heightDp = 42).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                        if (i > 0) marginStart = dp(8)
                     }
                     setOnClickListener { playbackService?.adjustDelaySeconds(delta) }
                 }
             )
         }
 
-        // Playback Navigation & Audio Action Row
-        val navRow = LinearLayout(this).apply {
+        seekCard.addView(seekBoundsRow)
+        seekCard.addView(seekDelay)
+        seekCard.addView(stepRowMinus)
+        seekCard.addView(stepRowPlus)
+        content.addView(seekCard)
+
+        // 3. 2-Tap Manual Sync Stopwatch Card
+        content.addView(makeSectionHeading("المزامنة اليدوية بضغطتين").apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(20)
+        })
+
+        val stopwatchCard = makePage2Card().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(10)
+        }
+
+        val swDesc = TextView(this).apply {
+            text = "اضغط عند سماع الحدث في الراديو (يُكتم الصوت ويبدأ العد)، واضغط ثانيةً عند رؤيته على التلفاز لإضافة الفارق فوراً."
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            layoutParams = matchWrap()
+        }
+
+        val swRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = matchWrap().apply { topMargin = dp(12) }
         }
 
-        btnPrev = makePillButton("السابق", COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 44).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f)
-            setOnClickListener {
-                ensureServiceStarted()
-                val stepped = playbackService?.stepChannel(-1)
-                if (stepped == null) {
-                    toast("لا توجد قنوات في المكتبة النشطة.")
-                }
+        tvStopwatchDisplay = TextView(this).apply {
+            text = "0.00 ث"
+            setTextColor(COLOR_ACCENT_BLUE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(96), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                marginEnd = dp(10)
             }
         }
 
-        btnPlayPause = makePillButton("تشغيل", COLOR_SKY_DARK, Color.WHITE, heightDp = 44).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1.25f).apply {
-                marginStart = dp(6)
-                marginEnd = dp(6)
-            }
-            setOnClickListener {
-                ensureServiceStarted()
-                playbackService?.togglePlayPause()
-            }
+        btnTwoTapSync = makePillButton(
+            text = "مزامنة بضغطتين",
+            bgColor = Color.parseColor("#2B2B2B"),
+            textColor = Color.WHITE,
+            strokeColor = Color.parseColor("#3E3E3E"),
+            heightDp = 46,
+            textSizeSp = 14f
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f)
+            setOnClickListener { handleTwoTapStopwatchClick() }
         }
 
-        btnNext = makePillButton("التالي", COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 44).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f)
-            setOnClickListener {
-                ensureServiceStarted()
-                val stepped = playbackService?.stepChannel(+1)
-                if (stepped == null) {
-                    toast("لا توجد قنوات في المكتبة النشطة.")
-                }
-            }
+        swRow.addView(tvStopwatchDisplay)
+        swRow.addView(btnTwoTapSync)
+
+        stopwatchCard.addView(swDesc)
+        stopwatchCard.addView(swRow)
+        content.addView(stopwatchCard)
+
+        // 4. Sync & Audio Calibration Card
+        content.addView(makeSectionHeading("إعدادات المزامنة والمعايرة").apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(20)
+        })
+
+        val calCard = makePage2Card().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(10)
         }
 
-        navRow.addView(btnPrev)
-        navRow.addView(btnPlayPause)
-        navRow.addView(btnNext)
-
-        val utilityRow = LinearLayout(this).apply {
+        // Earphone No-Mute Toggle
+        val earphoneRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = matchWrap()
+        }
+
+        val earphoneCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        earphoneCol.addView(TextView(this).apply {
+            text = "سماعة أذن (بدون كتم)"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        earphoneCol.addView(TextView(this).apply {
+            text = "إبقاء صوت الراديو يعمل أثناء استماع الميكروفون للتلفاز"
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+        })
+
+        swEarphoneNoMute = Switch(this).apply {
+            isChecked = prefs.isEarphoneNoMuteEnabled()
+            thumbTintList = ColorStateList.valueOf(Color.WHITE)
+            trackTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(COLOR_ACCENT_BLUE, Color.parseColor("#444444"))
+            )
+            setOnCheckedChangeListener { _, isChecked ->
+                prefs.setEarphoneNoMuteEnabled(isChecked)
+            }
+        }
+
+        earphoneRow.addView(earphoneCol)
+        earphoneRow.addView(swEarphoneNoMute)
+
+        // Divider
+        val div1 = makeSubtleDivider()
+
+        // Sync Timeout Selector (45 / 60 / 80s)
+        val timeoutLabel = TextView(this).apply {
+            text = "أقصى مدة بحث للمزامنة التلقائية"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = matchWrap()
+        }
+
+        val timeoutRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
             layoutParams = matchWrap().apply { topMargin = dp(8) }
         }
 
-        btnMute = makePillButton("كتم الصوت", COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 42).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f)
-            setOnClickListener { playbackService?.toggleMute() }
+        btnTimeout45 = makeSmallOptionChip("45 ث") {
+            prefs.setSyncTimeoutSec(45)
+            refreshTimeoutPills()
+        }
+        btnTimeout60 = makeSmallOptionChip("60 ث") {
+            prefs.setSyncTimeoutSec(60)
+            refreshTimeoutPills()
+        }
+        btnTimeout80 = makeSmallOptionChip("80 ث") {
+            prefs.setSyncTimeoutSec(80)
+            refreshTimeoutPills()
         }
 
-        btnResetDelay = makePillButton("تصفير (0.00 ث)", COLOR_SURFACE_ELEVATED, COLOR_TEXT_SECONDARY, heightDp = 42).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-                marginStart = dp(8)
-            }
-            setOnClickListener { playbackService?.resetDelay() }
-        }
+        timeoutRow.addView(btnTimeout45)
+        timeoutRow.addView(spaceHorizontal(8))
+        timeoutRow.addView(btnTimeout60)
+        timeoutRow.addView(spaceHorizontal(8))
+        timeoutRow.addView(btnTimeout80)
 
-        utilityRow.addView(btnMute)
-        utilityRow.addView(btnResetDelay)
+        // Divider
+        val div2 = makeSubtleDivider()
 
-        card.addView(delayLabel)
-        card.addView(tvDelayReadout)
-        card.addView(syncButtonsRow)
-        card.addView(syncProgressContainer)
-        card.addView(tvSyncBanner)
-        card.addView(btnApplyCandidate)
-        card.addView(syncOptionsRow)
-        card.addView(earphoneRow)
-        card.addView(seekHeader)
-        card.addView(seekDelay)
-        card.addView(tuneRow1)
-        card.addView(tuneRow2)
-        card.addView(navRow)
-        card.addView(utilityRow)
-        return card
-    }
-
-    private fun buildCalibrationCard(): LinearLayout {
-        val card = makeCard()
-
-        val title = TextView(this).apply {
+        // Speaker / Bluetooth Calibration Trim (-2.00s .. +2.00s in 0.05s steps)
+        val calTitle = TextView(this).apply {
             text = "معايرة السماعة / البلوتوث"
-            setTextColor(COLOR_TEXT_PRIMARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
             typeface = Typeface.DEFAULT_BOLD
         }
-
-        val subtitle = TextView(this).apply {
-            text = "تصحيح ثابت يُضاف تلقائياً بعد كل مزامنة (-2.00 إلى +2.00 ث)"
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        val calSub = TextView(this).apply {
+            text = "تصحيح ثابت يُضاف تلقائياً بعد المزامنة (-2.00 إلى +2.00 ث • اضغط الرقم للتصفير)"
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             layoutParams = matchWrap().apply { topMargin = dp(2) }
         }
 
-        val row = LinearLayout(this).apply {
+        val calRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_LTR
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = matchWrap().apply { topMargin = dp(10) }
         }
 
-        val btnMinus = makePillButton("-0.05 ث", COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 40).apply {
+        val btnCalMinus = makePillButton("-0.05 ث", Color.parseColor("#2B2B2B"), Color.WHITE, heightDp = 40).apply {
             layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f)
             setOnClickListener { adjustCalibration(-0.05) }
         }
 
         tvCalibrationValue = TextView(this).apply {
-            setTextColor(COLOR_SKY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(COLOR_ACCENT_BLUE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.5f)
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
             gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.1f)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.15f)
             setOnClickListener {
                 prefs.setCalibrationTrimSec(0.0)
                 refreshCalibrationReadout()
-                toast("تم تصفير المعايرة.")
+                toast("تم تصفير معايرة السماعة.")
             }
         }
 
-        val btnPlus = makePillButton("+0.05 ث", COLOR_SURFACE_ELEVATED, COLOR_TEXT_PRIMARY, heightDp = 40).apply {
+        val btnCalPlus = makePillButton("+0.05 ث", Color.parseColor("#2B2B2B"), Color.WHITE, heightDp = 40).apply {
             layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f)
             setOnClickListener { adjustCalibration(+0.05) }
         }
 
-        row.addView(btnMinus)
-        row.addView(tvCalibrationValue)
-        row.addView(btnPlus)
+        calRow.addView(btnCalMinus)
+        calRow.addView(tvCalibrationValue)
+        calRow.addView(btnCalPlus)
 
-        card.addView(title)
-        card.addView(subtitle)
-        card.addView(row)
-        return card
+        calCard.addView(earphoneRow)
+        calCard.addView(div1)
+        calCard.addView(timeoutLabel)
+        calCard.addView(timeoutRow)
+        calCard.addView(div2)
+        calCard.addView(calTitle)
+        calCard.addView(calSub)
+        calCard.addView(calRow)
+        content.addView(calCard)
+
+        scroll.addView(content)
+        page.addView(topBar)
+        page.addView(scroll)
+        return page
     }
 
-    private fun buildLibrariesAndChannelsCard(): LinearLayout {
-        val card = makeCard()
+    // =========================================================================
+    // PAGE 3 (LEFT — Libraries 2-Column Grid + In-Page Channels, Marked "3")
+    // =========================================================================
 
-        val headerRow = LinearLayout(this).apply {
+    private fun buildPage3Libraries(): View {
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            setBackgroundColor(COLOR_DARK_SURFACE_BG)
+        }
+
+        // Top Bar (LTR): Left = Gear/Overlay icon (matching screenshot #3), Center = "المكتبات" + dots (1st white), Right = "+ رابط" & arrow to center
+        val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(8))
             layoutParams = matchWrap()
         }
 
-        val headerTitle = TextView(this).apply {
-            text = "المكتبات الصوتية والقنوات"
-            setTextColor(COLOR_TEXT_PRIMARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            typeface = Typeface.DEFAULT_BOLD
+        val btnGearOverlay = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+            background = rippleButtonDrawable(Color.TRANSPARENT, Color.TRANSPARENT, dp(20).toFloat())
+            setOnClickListener { handleFloatingOverlayClick() }
+            addView(
+                VectorIconView(this@MainActivity, IconType.GEAR, Color.WHITE),
+                FrameLayout.LayoutParams(dp(23), dp(23), Gravity.CENTER)
+            )
+        }
+        applySpringTouch(btnGearOverlay)
+
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val btnAddManual = makePillButton(
-            text = "+ رابط",
-            bgColor = COLOR_SURFACE_ELEVATED,
-            textColor = COLOR_TEXT_PRIMARY,
-            heightDp = 36,
-            textSizeSp = 12.5f
-        ).apply {
-            setPadding(dp(11), dp(6), dp(11), dp(6))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                dp(36)
-            ).apply { marginEnd = dp(6) }
-            setOnClickListener { showAddManualUrlDialog() }
+        val tvTitle = TextView(this).apply {
+            text = "المكتبات"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
         }
 
-        val btnAddLibrary = makePillButton(
-            text = "إضافة مكتبة",
-            bgColor = COLOR_ACCENT_DARK,
-            textColor = COLOR_TEXT_ON_ACCENT,
-            heightDp = 36,
-            textSizeSp = 12.5f
-        ).apply {
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                dp(36)
-            )
-            setOnClickListener { showAddLibraryChooserDialog() }
-        }
-
-        headerRow.addView(headerTitle)
-        headerRow.addView(btnAddManual)
-        headerRow.addView(btnAddLibrary)
-
-        // Horizontal selectable library chips
-        val chipsScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            layoutParams = matchWrap().apply { topMargin = dp(10) }
-        }
-
-        libraryChipsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        val dots = buildPaginationDots(activeIndex = 0).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+            ).apply { topMargin = dp(6) }
         }
-        chipsScroll.addView(libraryChipsContainer)
 
-        // Active library subheader + rename/delete action
-        val activeLibRow = LinearLayout(this).apply {
+        titleCol.addView(tvTitle)
+        titleCol.addView(dots)
+
+        val rightActions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            layoutParams = matchWrap().apply { topMargin = dp(10) }
         }
 
-        tvLibraryHeaderCount = TextView(this).apply {
-            setTextColor(COLOR_TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        val btnQuickManual = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+            background = rippleButtonDrawable(Color.TRANSPARENT, Color.TRANSPARENT, dp(18).toFloat())
+            setOnClickListener { showAddManualUrlDialog() }
+            addView(
+                VectorIconView(this@MainActivity, IconType.PLUS, Color.WHITE),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)
+            )
+        }
+        applySpringTouch(btnQuickManual)
+
+        val btnToCenter = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(34), dp(36))
+            background = rippleButtonDrawable(Color.TRANSPARENT, Color.TRANSPARENT, dp(18).toFloat())
+            setOnClickListener { pager.scrollToPage(PAGE_HOME, animated = true) }
+            addView(
+                VectorIconView(this@MainActivity, IconType.FORWARD_RIGHT, Color.WHITE),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)
+            )
+        }
+        applySpringTouch(btnToCenter)
+
+        rightActions.addView(btnQuickManual)
+        rightActions.addView(btnToCenter)
+
+        topBar.addView(btnGearOverlay)
+        topBar.addView(titleCol)
+        topBar.addView(rightActions)
+
+        // Helper subtitle (matching screenshot #3 centered muted gray text)
+        tvLibrariesSubtitle = TextView(this).apply {
+            text = "أضف مكتبات الصوتيات أو اختر مكتبة للتشغيل التسلسلي"
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            gravity = Gravity.CENTER
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(22), dp(8), dp(22), dp(14))
+            layoutParams = matchWrap()
         }
 
-        btnManageActiveLibrary = TextView(this).apply {
-            text = "إدارة المكتبة"
-            setTextColor(COLOR_SKY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+        // Mode A: 2-Column Shazam-Style Library Card Grid
+        librariesGridScroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_ALWAYS
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        librariesGridContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            setPadding(dp(14), dp(2), dp(14), dp(28))
+            layoutParams = matchWrap()
+        }
+        librariesGridScroll.addView(librariesGridContainer)
+
+        // Mode B: In-Page Sequential Channel Browser (shown when a library card is tapped)
+        channelBrowserContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        val browserHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(8), dp(14), dp(10))
+            layoutParams = matchWrap()
+        }
+
+        val btnBackToLibs = makePillButton(
+            text = "← رجوع للمكتبات",
+            bgColor = Color.parseColor("#232323"),
+            textColor = Color.WHITE,
+            heightDp = 36,
+            textSizeSp = 12.5f
+        ).apply {
+            setPadding(dp(12), 0, dp(12), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                dp(36)
+            )
+            setOnClickListener {
+                browsingLibraryId = null
+                refreshLibrariesPageUi()
+            }
+        }
+
+        val spacer = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        }
+
+        val btnAddManualInBrowser = makePillButton(
+            text = "+ رابط يدوي",
+            bgColor = Color.parseColor("#232323"),
+            textColor = COLOR_ACCENT_BLUE,
+            heightDp = 36,
+            textSizeSp = 12.5f
+        ).apply {
+            setPadding(dp(11), 0, dp(11), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                dp(36)
+            )
+            setOnClickListener { showAddManualUrlDialog() }
+        }
+
+        btnChannelBrowserManage = makePillButton(
+            text = "إدارة",
+            bgColor = Color.parseColor("#232323"),
+            textColor = COLOR_GRAY_SUBTITLE,
+            heightDp = 36,
+            textSizeSp = 12.5f
+        ).apply {
+            setPadding(dp(11), 0, dp(11), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                dp(36)
+            ).apply { marginStart = dp(6) }
+            setOnClickListener {
+                val id = browsingLibraryId ?: return@setOnClickListener
+                showManageLibraryDialog(id)
+            }
+        }
+
+        browserHeader.addView(btnBackToLibs)
+        browserHeader.addView(spacer)
+        browserHeader.addView(btnAddManualInBrowser)
+        browserHeader.addView(btnChannelBrowserManage)
+
+        val browserInfoRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(2), dp(16), dp(10))
+            layoutParams = matchWrap()
+        }
+
+        tvChannelBrowserTitle = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(8), dp(4), dp(8), dp(4))
-            setOnClickListener { showManageLibraryDialog(selectedLibraryId) }
+        }
+        tvChannelBrowserCount = TextView(this).apply {
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            layoutParams = matchWrap().apply { topMargin = dp(2) }
+        }
+        browserInfoRow.addView(tvChannelBrowserTitle)
+        browserInfoRow.addView(tvChannelBrowserCount)
+
+        val channelsScroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_ALWAYS
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
         }
 
-        activeLibRow.addView(tvLibraryHeaderCount)
-        activeLibRow.addView(btnManageActiveLibrary)
-
-        // Sequential numbered channel rows
         channelsListContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(14), dp(2), dp(14), dp(28))
+            layoutParams = matchWrap()
+        }
+        channelsScroll.addView(channelsListContainer)
+
+        channelBrowserContainer.addView(browserHeader)
+        channelBrowserContainer.addView(browserInfoRow)
+        channelBrowserContainer.addView(channelsScroll)
+
+        page.addView(topBar)
+        page.addView(tvLibrariesSubtitle)
+        page.addView(librariesGridScroll)
+        page.addView(channelBrowserContainer)
+        return page
+    }
+
+    private fun buildFeaturedAddLibraryCard(): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(14), dp(18), dp(14), dp(14))
+            background = roundedDrawable(
+                fillColor = COLOR_LIB_CARD_BG,
+                strokeColor = Color.parseColor("#2E2E2E"),
+                strokeWidthPx = dp(1),
+                radiusPx = dp(16).toFloat()
+            )
+            minimumHeight = dp(246)
+            setOnClickListener { showAddLibraryChooserDialog() }
+        }
+        applySpringTouch(card)
+
+        val musicIcon = VectorIconView(this, IconType.MUSIC_NOTE, Color.WHITE).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                topMargin = dp(4)
+            }
+        }
+
+        val title = TextView(this).apply {
+            text = "إضافة مكتبة صوتيات"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            layoutParams = matchWrap().apply { topMargin = dp(14) }
+        }
+
+        val desc = TextView(this).apply {
+            text = "M3U / M3U8 / JSON / XML / TXT / GX / Sunplus / ALI"
+            setTextColor(COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            gravity = Gravity.CENTER
             layoutParams = matchWrap().apply { topMargin = dp(8) }
         }
 
-        card.addView(headerRow)
-        card.addView(chipsScroll)
-        card.addView(activeLibRow)
-        card.addView(channelsListContainer)
+        val flexSpace = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, 0, 1f)
+        }
+
+        // High-contrast white pill button (#FFFFFF bg, black bold text) matching screenshot #3
+        val ctaButton = TextView(this).apply {
+            text = "إضافة مكتبة"
+            setTextColor(Color.BLACK)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            minHeight = dp(40)
+            background = rippleButtonDrawable(
+                fillColor = Color.WHITE,
+                strokeColor = Color.TRANSPARENT,
+                radiusPx = dp(10).toFloat()
+            )
+            layoutParams = matchWrap().apply { topMargin = dp(14) }
+            setOnClickListener { showAddLibraryChooserDialog() }
+        }
+        applySpringTouch(ctaButton)
+
+        card.addView(musicIcon)
+        card.addView(title)
+        card.addView(desc)
+        card.addView(flexSpace)
+        card.addView(ctaButton)
         return card
     }
 
-    // === State Rendering ===
+    private fun buildShazamLibraryCard(lib: RadioLibrary): View {
+        val isPlayingLib = latestState.libraryId == lib.id && latestState.channelIndex >= 0
+        val isSelected = selectedLibraryId == lib.id
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            minimumHeight = dp(246)
+            background = roundedDrawable(
+                fillColor = COLOR_LIB_CARD_BG,
+                strokeColor = if (isPlayingLib) COLOR_ACCENT_BLUE else Color.parseColor("#262626"),
+                strokeWidthPx = if (isPlayingLib) dp(1.5f) else dp(1),
+                radiusPx = dp(16).toFloat()
+            )
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, dp(16).toFloat())
+                }
+            }
+            setOnClickListener {
+                selectedLibraryId = lib.id
+                libraryManager.setActiveLibrary(lib.id)
+                browsingLibraryId = lib.id
+                refreshLibrariesPageUi()
+            }
+            setOnLongClickListener {
+                if (!lib.isManualDefault) {
+                    showManageLibraryDialog(lib.id)
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        applySpringTouch(card)
+
+        // Upper square #2C2C2C cover artwork area matching screenshot #3
+        val coverArea = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(156)
+            )
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(COLOR_LIB_COVER_BG)
+                val r = dp(16).toFloat()
+                cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+            }
+        }
+
+        // Center music/radio vector icon with optional #0A84FF ring if active
+        val iconCircle = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(74), dp(74), Gravity.CENTER)
+            background = if (isPlayingLib || isSelected) {
+                roundedDrawable(
+                    fillColor = Color.parseColor("#220A84FF"),
+                    strokeColor = COLOR_ACCENT_BLUE,
+                    strokeWidthPx = dp(2),
+                    radiusPx = dp(37).toFloat()
+                )
+            } else {
+                null
+            }
+            addView(
+                VectorIconView(
+                    this@MainActivity,
+                    IconType.MUSIC_NOTE,
+                    if (isPlayingLib) COLOR_ACCENT_BLUE else Color.parseColor("#545454")
+                ),
+                FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER)
+            )
+        }
+        coverArea.addView(iconCircle)
+
+        // Compact 3-dot manage menu button on upper corner for imported libraries
+        if (!lib.isManualDefault) {
+            val menuBtn = FrameLayout(this).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(34), dp(34), Gravity.TOP or Gravity.END).apply {
+                    topMargin = dp(4)
+                    marginEnd = dp(4)
+                }
+                background = rippleButtonDrawable(Color.parseColor("#44000000"), Color.TRANSPARENT, dp(17).toFloat())
+                setOnClickListener { showManageLibraryDialog(lib.id) }
+                addView(
+                    VectorIconView(this@MainActivity, IconType.MORE_VERT, Color.WHITE),
+                    FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+                )
+            }
+            coverArea.addView(menuBtn)
+        }
+
+        // Lower #1A1A1A section showing Library Name (bold white) + Channel Count (gray)
+        val infoSection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val nameView = TextView(this).apply {
+            text = lib.name
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }
+
+        val countText = when (lib.channels.size) {
+            0 -> "فارغة"
+            1 -> "قناة واحدة"
+            2 -> "قناتان"
+            else -> "${lib.channels.size} قناة"
+        }
+
+        val countView = TextView(this).apply {
+            text = if (isPlayingLib) "$countText • قيد التشغيل" else countText
+            setTextColor(if (isPlayingLib) COLOR_ACCENT_BLUE else COLOR_GRAY_SUBTITLE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = matchWrap().apply { topMargin = dp(4) }
+        }
+
+        infoSection.addView(nameView)
+        infoSection.addView(countView)
+
+        card.addView(coverArea)
+        card.addView(infoSection)
+        return card
+    }
+
+    // =========================================================================
+    // STATE RENDERING
+    // =========================================================================
 
     private fun renderServiceState(state: ServiceUiState) {
-        tvStationTitle.text = state.channelName
-        tvStationMeta.text = if (state.channelIndex >= 0 && state.totalChannels > 0) {
-            "${state.libraryName} • قناة ${state.channelIndex + 1} من ${state.totalChannels}"
-        } else {
-            "اختر قناة من المكتبات أو أضف رابط بث مباشر"
-        }
-
-        tvConnectionBadge.text = state.connectionStatus
-        val badgeColor = when {
-            state.isPlaying && !state.isBuffering -> COLOR_ACCENT
-            state.isBuffering -> COLOR_WARNING
-            else -> COLOR_TEXT_SECONDARY
-        }
-        tvConnectionBadge.setTextColor(badgeColor)
-
-        tvSpeedAndBuffer.text = String.format(
-            Locale.US,
-            "السرعة: %.1f KB/s • الذاكرة: %d ث",
-            state.speedKbps,
-            state.bufferedHistorySec.toInt()
-        )
-
-        if (!userDraggingSeekBar) {
-            tvDelayReadout.text = String.format(Locale.US, "%.2f ث", state.delaySec)
-            seekDelay.progress = (state.delaySec * 10.0).roundToInt().coerceIn(0, seekDelay.max)
-        }
-
-        btnPlayPause.text = if (state.isPlaying || state.isBuffering) "إيقاف مؤقت" else "تشغيل"
-
-        btnMute.text = if (state.isMuted) "إلغاء الكتم" else "كتم الصوت"
-        btnMute.background = rippleButtonDrawable(
-            if (state.isMuted) COLOR_WARNING_SOFT else COLOR_SURFACE_ELEVATED,
-            if (state.isMuted) COLOR_WARNING else Color.TRANSPARENT,
-            dp(12).toFloat()
-        )
-        btnMute.setTextColor(if (state.isMuted) COLOR_WARNING else COLOR_TEXT_PRIMARY)
-
-        btnFloatingOverlay.text = if (state.isOverlayVisible) "إخفاء العائمة" else "نافذة عائمة"
-
         // Keep screen awake ONLY while auto-sync is actively measuring
         if (state.isSyncing) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -912,111 +1696,212 @@ class MainActivity : AppCompatActivity() {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
 
-        if (state.isSyncing) {
-            btnAutoSync.text = "إلغاء المزامنة"
-            btnAutoSync.background = rippleButtonDrawable(COLOR_DANGER, Color.TRANSPARENT, dp(12).toFloat())
-            btnAutoSync.setTextColor(Color.WHITE)
-            syncProgressContainer.visibility = View.VISIBLE
-            tvSyncLiveStatus.text = state.syncStatusText.ifBlank { "جاري الاستماع والمطابقة…" }
-            pbMicLevel.progress = (state.syncMicLevel * 100f).roundToInt().coerceIn(0, 100)
+        val delayText = String.format(Locale.US, "%.2f ث", state.delaySec)
+
+        // --- Page 1 (Center Home) updates ---
+        tvHomeStationPill.text = if (state.channelIndex >= 0 && state.totalChannels > 0) {
+            "${state.channelIndex + 1}/${state.totalChannels} • ${state.channelName}"
         } else {
-            btnAutoSync.text = "زامن"
-            btnAutoSync.background = rippleButtonDrawable(COLOR_ACCENT_DARK, Color.TRANSPARENT, dp(12).toFloat())
-            btnAutoSync.setTextColor(COLOR_TEXT_ON_ACCENT)
-            syncProgressContainer.visibility = View.GONE
+            state.channelName
+        }
+        tvHomeDelayPill.text = delayText
+
+        val dotColor = when {
+            state.isSyncing -> COLOR_SHAZAM_BLUE
+            state.isPlaying && !state.isBuffering -> COLOR_ACCENT_GREEN
+            state.isBuffering -> COLOR_WARNING
+            else -> COLOR_TEXT_MUTED
+        }
+        homeStatusDot.background = roundedDrawable(dotColor, Color.TRANSPARENT, 0, dp(4).toFloat())
+
+        pulseRingView.setListening(state.isSyncing)
+        pulseRingView.setMicLevel(state.syncMicLevel)
+        heroCircleButton.background = buildHeroCircleDrawable(isListening = state.isSyncing)
+
+        if (state.isSyncing) {
+            tvHomePrompt.text = when {
+                state.syncHasCandidate && state.syncCandidateSec != null ->
+                    String.format(Locale.US, "تم رصد مرشّح %.1f ث • يتأكد…", state.syncCandidateSec)
+
+                else -> "جاري الاستماع لصوت التلفاز…"
+            }
+            tvHomeSyncSubtext.text = state.syncStatusText.ifBlank {
+                "جاري تحليل البصمة الصوتية (${state.syncElapsedSec}/${state.syncTimeoutSec} ث)"
+            }
+            tvHomeSyncSubtext.visibility = View.VISIBLE
+        } else {
+            tvHomePrompt.text = "اضغط للمزامنة"
+            tvHomeSyncSubtext.text = if (state.isPlaying || state.isBuffering) {
+                String.format(Locale.US, "%s • %.1f KB/s", state.connectionStatus, state.speedKbps)
+            } else {
+                ""
+            }
+            tvHomeSyncSubtext.visibility = if (tvHomeSyncSubtext.text.isNotEmpty()) View.VISIBLE else View.INVISIBLE
         }
 
-        if (state.lastSyncBannerText.isNotBlank()) {
-            tvSyncBanner.text = state.lastSyncBannerText
-            tvSyncBanner.visibility = View.VISIBLE
+        if (!state.isSyncing && state.lastSyncBannerText.isNotBlank()) {
+            tvHomeBanner.text = state.lastSyncBannerText
+            tvHomeBanner.visibility = View.VISIBLE
         } else {
-            tvSyncBanner.visibility = View.GONE
+            tvHomeBanner.visibility = View.GONE
         }
 
         val unconfirmed = state.unconfirmedCandidateSec
         if (!state.isSyncing && unconfirmed != null) {
-            btnApplyCandidate.text = String.format(Locale.US, "تطبيق المرشّح %.1f ث", unconfirmed)
-            btnApplyCandidate.visibility = View.VISIBLE
+            btnHomeApplyCandidate.text = String.format(Locale.US, "تطبيق المرشّح %.1f ث", unconfirmed)
+            btnHomeApplyCandidate.visibility = View.VISIBLE
         } else {
-            btnApplyCandidate.visibility = View.GONE
+            btnHomeApplyCandidate.visibility = View.GONE
         }
 
-        // Keep active library channel highlight synchronized with service
-        renderChannelsListOnly()
+        // Bottom quick buttons state
+        val activePlayback = state.isPlaying || state.isBuffering
+        icHomePlayPause.setIcon(if (activePlayback) IconType.PAUSE else IconType.PLAY, Color.WHITE)
+        lblHomePlayPause.text = if (activePlayback) "إيقاف" else "تشغيل"
+        btnHomePlayPause.background = rippleButtonDrawable(
+            fillColor = if (activePlayback) COLOR_ACCENT_BLUE else COLOR_HOME_CIRCLE_BTN,
+            strokeColor = if (activePlayback) COLOR_ACCENT_BLUE else Color.parseColor("#2E3540"),
+            radiusPx = dp(28).toFloat()
+        )
+
+        icHomeMute.setIcon(
+            if (state.isMuted) IconType.MUTE else IconType.UNMUTE,
+            if (state.isMuted) COLOR_WARNING else Color.WHITE
+        )
+        lblHomeMute.text = if (state.isMuted) "مكتوم" else "كتم"
+        btnHomeMute.background = rippleButtonDrawable(
+            fillColor = if (state.isMuted) COLOR_WARNING_SOFT else COLOR_HOME_CIRCLE_BTN,
+            strokeColor = if (state.isMuted) COLOR_WARNING else Color.parseColor("#2E3540"),
+            radiusPx = dp(24).toFloat()
+        )
+
+        icHomeOverlay.setIcon(
+            IconType.OVERLAY,
+            if (state.isOverlayVisible) COLOR_ACCENT_BLUE else Color.WHITE
+        )
+        btnHomeOverlay.background = rippleButtonDrawable(
+            fillColor = if (state.isOverlayVisible) Color.parseColor("#220A84FF") else COLOR_HOME_CIRCLE_BTN,
+            strokeColor = if (state.isOverlayVisible) COLOR_ACCENT_BLUE else Color.parseColor("#2E3540"),
+            radiusPx = dp(24).toFloat()
+        )
+
+        // --- Page 2 (Right Delay Controls) updates ---
+        if (!userDraggingSeekBar) {
+            tvDelayReadout.text = delayText
+            seekDelay.progress = (state.delaySec * 10.0).roundToInt().coerceIn(0, seekDelay.max)
+        }
+        tvDelayBufferInfo.text = String.format(
+            Locale.US,
+            "الذاكرة الصوتية: %d ث • السرعة: %.1f KB/s • %s",
+            state.bufferedHistorySec.toInt(),
+            state.speedKbps,
+            state.connectionStatus
+        )
+
+        // --- Page 3 (Left Libraries / Channels) highlight refresh ---
+        refreshLibrariesPageUi()
     }
 
-    private fun refreshLibraryUi() {
+    private fun refreshLibrariesPageUi() {
         val libs = libraryManager.getLibraries()
         if (libs.none { it.id == selectedLibraryId }) {
             selectedLibraryId = libs.first().id
         }
 
-        libraryChipsContainer.removeAllViews()
-        libs.forEachIndexed { index, lib ->
-            val isSelected = lib.id == selectedLibraryId
-            val chip = TextView(this).apply {
-                text = "${lib.name} (${lib.channels.size})"
-                setTextColor(if (isSelected) COLOR_TEXT_ON_ACCENT else COLOR_TEXT_PRIMARY)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                typeface = if (isSelected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-                setPadding(dp(14), dp(8), dp(14), dp(8))
-                background = rippleButtonDrawable(
-                    fillColor = if (isSelected) COLOR_ACCENT else COLOR_SURFACE_ELEVATED,
-                    strokeColor = if (isSelected) COLOR_ACCENT else COLOR_BORDER,
-                    radiusPx = dp(20).toFloat()
-                )
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    if (index > 0) marginStart = dp(8)
-                }
-                setOnClickListener {
-                    selectedLibraryId = lib.id
-                    libraryManager.setActiveLibrary(lib.id)
-                    refreshLibraryUi()
-                }
-                setOnLongClickListener {
-                    if (!lib.isManualDefault) {
-                        showManageLibraryDialog(lib.id)
-                        true
-                    } else {
-                        false
-                    }
-                }
-            }
-            libraryChipsContainer.addView(chip)
-        }
+        val openLibId = browsingLibraryId
+        val openLib = if (openLibId != null) libs.firstOrNull { it.id == openLibId } else null
 
-        renderChannelsListOnly()
+        if (openLib == null) {
+            browsingLibraryId = null
+            tvLibrariesSubtitle.visibility = View.VISIBLE
+            librariesGridScroll.visibility = View.VISIBLE
+            channelBrowserContainer.visibility = View.GONE
+            renderLibrariesTwoColumnGrid(libs)
+        } else {
+            tvLibrariesSubtitle.visibility = View.GONE
+            librariesGridScroll.visibility = View.GONE
+            channelBrowserContainer.visibility = View.VISIBLE
+            renderInPageChannelList(openLib)
+        }
     }
 
-    private fun renderChannelsListOnly() {
-        val activeLib = libraryManager.getLibraryById(selectedLibraryId) ?: libraryManager.getActiveLibrary()
-        selectedLibraryId = activeLib.id
+    private fun renderLibrariesTwoColumnGrid(libs: List<RadioLibrary>) {
+        librariesGridContainer.removeAllViews()
 
-        tvLibraryHeaderCount.text = "المكتبة النشطة: ${activeLib.name} • ${activeLib.channels.size} قناة بالترتيب"
-        btnManageActiveLibrary.visibility = if (activeLib.isManualDefault) View.GONE else View.VISIBLE
+        val cards = ArrayList<View>(libs.size + 1)
+        cards.add(buildFeaturedAddLibraryCard())
+        for (lib in libs) {
+            cards.add(buildShazamLibraryCard(lib))
+        }
+
+        var i = 0
+        while (i < cards.size) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                layoutParams = matchWrap().apply {
+                    if (i > 0) topMargin = dp(12)
+                }
+            }
+
+            val leftCard = cards[i]
+            leftCard.layoutParams = LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                1f
+            ).apply {
+                marginEnd = dp(6)
+            }
+            row.addView(leftCard)
+
+            if (i + 1 < cards.size) {
+                val rightCard = cards[i + 1]
+                rightCard.layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    1f
+                ).apply {
+                    marginStart = dp(6)
+                }
+                row.addView(rightCard)
+            } else {
+                val emptySlot = View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, 1, 1f).apply {
+                        marginStart = dp(6)
+                    }
+                }
+                row.addView(emptySlot)
+            }
+
+            librariesGridContainer.addView(row)
+            i += 2
+        }
+    }
+
+    private fun renderInPageChannelList(lib: RadioLibrary) {
+        tvChannelBrowserTitle.text = lib.name
+        tvChannelBrowserCount.text = "${lib.channels.size} قناة بالترتيب التسلسلي • اضغط للتشغيل أو اضغط مطولاً للحذف"
+        btnChannelBrowserManage.visibility = if (lib.isManualDefault) View.GONE else View.VISIBLE
 
         channelsListContainer.removeAllViews()
-        if (activeLib.channels.isEmpty()) {
+        if (lib.channels.isEmpty()) {
             val emptyView = TextView(this).apply {
-                text = if (activeLib.isManualDefault) {
-                    "لا توجد روابط يدوية بعد. اضغط \"+ رابط\" لإضافة بث مباشر أو \"إضافة مكتبة\" لاستيراد ملف M3U / JSON / XML / TXT."
+                text = if (lib.isManualDefault) {
+                    "لا توجد روابط يدوية بعد.\nاضغط \"+ رابط يدوي\" لإضافة رابط بث مباشر."
                 } else {
                     "هذه المكتبة فارغة."
                 }
-                setTextColor(COLOR_TEXT_SECONDARY)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(COLOR_GRAY_SUBTITLE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
                 gravity = Gravity.CENTER
-                setPadding(dp(12), dp(20), dp(12), dp(20))
+                setPadding(dp(16), dp(36), dp(16), dp(36))
             }
             channelsListContainer.addView(emptyView)
             return
         }
 
-        activeLib.channels.forEachIndexed { idx, channel ->
-            val isCurrentlyPlaying = latestState.libraryId == activeLib.id &&
+        lib.channels.forEachIndexed { idx, channel ->
+            val isCurrentlyPlaying = latestState.libraryId == lib.id &&
                 latestState.channelIndex == idx &&
                 latestState.channelUrl == channel.url
 
@@ -1024,40 +1909,41 @@ class MainActivity : AppCompatActivity() {
 
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(11), dp(12), dp(11))
+                setPadding(dp(12), dp(12), dp(12), dp(12))
                 background = rippleButtonDrawable(
-                    fillColor = if (isCurrentlyPlaying) COLOR_ACTIVE_ROW_BG else COLOR_SURFACE_ELEVATED,
-                    strokeColor = if (isCurrentlyPlaying) COLOR_ACCENT else COLOR_BORDER,
-                    radiusPx = dp(12).toFloat()
+                    fillColor = if (isCurrentlyPlaying) Color.parseColor("#13233A") else COLOR_PAGE2_CARD,
+                    strokeColor = if (isCurrentlyPlaying) COLOR_ACCENT_BLUE else Color.parseColor("#2A2A2A"),
+                    radiusPx = dp(14).toFloat()
                 )
                 layoutParams = matchWrap().apply {
-                    if (idx > 0) topMargin = dp(7)
+                    if (idx > 0) topMargin = dp(8)
                 }
                 setOnClickListener {
                     ensureServiceStarted()
-                    playbackService?.playChannel(activeLib.id, idx)
+                    playbackService?.playChannel(lib.id, idx)
                 }
                 setOnLongClickListener {
-                    confirmDeleteChannel(activeLib, idx, channel)
+                    confirmDeleteChannel(lib, idx, channel)
                     true
                 }
             }
+            applySpringTouch(row)
 
-            // Numbered sequential badge (1, 2, 3...)
             val numBadge = TextView(this).apply {
                 text = "${idx + 1}"
-                setTextColor(if (isCurrentlyPlaying) COLOR_TEXT_ON_ACCENT else COLOR_TEXT_PRIMARY)
+                setTextColor(if (isCurrentlyPlaying) Color.WHITE else COLOR_GRAY_SUBTITLE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.CENTER
                 background = roundedDrawable(
-                    fillColor = if (isCurrentlyPlaying) COLOR_ACCENT else COLOR_BG,
+                    fillColor = if (isCurrentlyPlaying) COLOR_ACCENT_BLUE else Color.parseColor("#2A2A2A"),
                     strokeColor = Color.TRANSPARENT,
                     strokeWidthPx = 0,
-                    radiusPx = dp(8).toFloat()
+                    radiusPx = dp(9).toFloat()
                 )
-                layoutParams = LinearLayout.LayoutParams(dp(30), dp(30)).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(32), dp(32)).apply {
                     marginEnd = dp(10)
                 }
             }
@@ -1069,8 +1955,8 @@ class MainActivity : AppCompatActivity() {
 
             val nameView = TextView(this).apply {
                 text = channel.name
-                setTextColor(if (isCurrentlyPlaying) COLOR_ACCENT else COLOR_TEXT_PRIMARY)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(if (isCurrentlyPlaying) COLOR_ACCENT_BLUE else Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
                 typeface = if (isCurrentlyPlaying) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
@@ -1078,8 +1964,8 @@ class MainActivity : AppCompatActivity() {
 
             val subView = TextView(this).apply {
                 text = if (isCurrentlyPlaying) "قيد التشغيل الآن" else channel.url
-                setTextColor(if (isCurrentlyPlaying) COLOR_SKY else COLOR_TEXT_MUTED)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(if (isCurrentlyPlaying) Color.parseColor("#93C5FD") else Color.parseColor("#757575"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
             }
@@ -1115,10 +2001,10 @@ class MainActivity : AppCompatActivity() {
         val pairs = listOf(45 to btnTimeout45, 60 to btnTimeout60, 80 to btnTimeout80)
         for ((sec, view) in pairs) {
             val active = sec == current
-            view.setTextColor(if (active) COLOR_TEXT_ON_ACCENT else COLOR_TEXT_SECONDARY)
+            view.setTextColor(if (active) Color.WHITE else COLOR_GRAY_SUBTITLE)
             view.background = rippleButtonDrawable(
-                fillColor = if (active) COLOR_ACCENT else COLOR_SURFACE_ELEVATED,
-                strokeColor = if (active) COLOR_ACCENT else COLOR_BORDER,
+                fillColor = if (active) COLOR_ACCENT_BLUE else Color.parseColor("#2B2B2B"),
+                strokeColor = if (active) COLOR_ACCENT_BLUE else Color.parseColor("#3B3B3B"),
                 radiusPx = dp(10).toFloat()
             )
         }
@@ -1139,7 +2025,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // === Actions & Dialogs ===
+    // =========================================================================
+    // BUSINESS ACTIONS & DIALOGS (UNCHANGED CORE LOGIC)
+    // =========================================================================
+
+    private fun applyDirectDelayInput() {
+        val raw = etDirectDelay.text.toString().trim()
+        if (raw.isEmpty()) {
+            toast("أدخل قيمة التأخير بالثواني أولاً.")
+            return
+        }
+        val normalized = normalizeNumericInput(raw)
+        val parsed = normalized.toDoubleOrNull()
+        if (parsed == null || parsed < 0.0) {
+            toast("أدخل رقماً صالحاً بين 0 و 180 ثانية.")
+            return
+        }
+        val clamped = parsed.coerceIn(0.0, FootSyncPrefs.MAX_DELAY_SEC)
+        playbackService?.setDelaySeconds(clamped, persistForUrl = true)
+        etDirectDelay.setText(String.format(Locale.US, "%.2f", clamped))
+        etDirectDelay.clearFocus()
+        hideKeyboard()
+        toast(String.format(Locale.US, "تم ضبط التأخير على %.2f ث", clamped))
+    }
+
+    private fun normalizeNumericInput(input: String): String {
+        val sb = StringBuilder(input.length)
+        for (ch in input) {
+            when (ch) {
+                '٠', '۰' -> sb.append('0')
+                '١', '۱' -> sb.append('1')
+                '٢', '۲' -> sb.append('2')
+                '٣', '۳' -> sb.append('3')
+                '٤', '۴' -> sb.append('4')
+                '٥', '۵' -> sb.append('5')
+                '٦', '۶' -> sb.append('6')
+                '٧', '۷' -> sb.append('7')
+                '٨', '۸' -> sb.append('8')
+                '٩', '۹' -> sb.append('9')
+                ',', '٫', '،' -> sb.append('.')
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
 
     private fun handleAutoSyncClick() {
         val svc = playbackService
@@ -1185,13 +2114,14 @@ class MainActivity : AppCompatActivity() {
             val newDelay = (latestState.delaySec + elapsedSec).coerceIn(0.0, FootSyncPrefs.MAX_DELAY_SEC)
             svc.setDelaySeconds(newDelay, persistForUrl = true)
             svc.setMuted(false)
+            tvStopwatchDisplay.text = "0.00 ث"
             btnTwoTapSync.text = "مزامنة بضغطتين"
             btnTwoTapSync.background = rippleButtonDrawable(
-                COLOR_SURFACE_ELEVATED,
-                COLOR_BORDER,
+                Color.parseColor("#2B2B2B"),
+                Color.parseColor("#3E3E3E"),
                 dp(12).toFloat()
             )
-            btnTwoTapSync.setTextColor(COLOR_TEXT_PRIMARY)
+            btnTwoTapSync.setTextColor(Color.WHITE)
             toast(String.format(Locale.US, "تمت إضافة %.2f ث • التأخير الآن %.2f ث", elapsedSec, newDelay))
         }
     }
@@ -1228,15 +2158,17 @@ class MainActivity : AppCompatActivity() {
         val options = arrayOf(
             "استيراد ملف من الهاتف (M3U / JSON / XML / TXT / CFG)",
             "استيراد من رابط قائمة (URL)",
-            "لصق نص القائمة مباشرة"
+            "لصق نص القائمة مباشرة",
+            "إضافة رابط بث مباشر يدوي"
         )
         AlertDialog.Builder(this)
-            .setTitle("إضافة مكتبة صوتية")
+            .setTitle("إضافة مكتبة صوتيات")
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> openDocumentLauncher.launch(arrayOf("*/*"))
                     1 -> showImportUrlDialog()
                     2 -> showImportRawTextDialog()
+                    3 -> showAddManualUrlDialog()
                 }
             }
             .setNegativeButton("إلغاء", null)
@@ -1265,6 +2197,7 @@ class MainActivity : AppCompatActivity() {
     private fun showImportUrlDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
             setPadding(dp(20), dp(12), dp(20), dp(4))
         }
         val etName = makeDialogEditText("اسم المكتبة (اختياري)", "")
@@ -1298,6 +2231,7 @@ class MainActivity : AppCompatActivity() {
     private fun showImportRawTextDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
             setPadding(dp(20), dp(12), dp(20), dp(4))
         }
         val etName = makeDialogEditText("اسم المكتبة", "مكتبة جديدة")
@@ -1329,6 +2263,7 @@ class MainActivity : AppCompatActivity() {
     private fun showAddManualUrlDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
             setPadding(dp(20), dp(12), dp(20), dp(4))
         }
         val etName = makeDialogEditText("اسم المحطة (اختياري)", "")
@@ -1355,7 +2290,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val target = libraryManager.addManualChannel(url, name)
                 selectedLibraryId = target.libraryId
-                refreshLibraryUi()
+                refreshLibrariesPageUi()
                 ensureServiceStarted()
                 playbackService?.playTarget(target)
             }
@@ -1366,7 +2301,8 @@ class MainActivity : AppCompatActivity() {
     private fun handleImportResult(res: ImportResult) {
         if (res.success && res.library != null) {
             selectedLibraryId = res.library.id
-            refreshLibraryUi()
+            browsingLibraryId = res.library.id
+            refreshLibrariesPageUi()
             toast("تم استيراد ${res.channelCount} قناة (${res.detectedFormat}) إلى \"${res.library.name}\"")
         } else {
             toast(res.errorMessage ?: "فشل استيراد المكتبة.")
@@ -1389,7 +2325,7 @@ class MainActivity : AppCompatActivity() {
                             .setView(wrapDialogView(input))
                             .setPositiveButton("حفظ") { _, _ ->
                                 if (libraryManager.renameLibrary(lib.id, input.text.toString())) {
-                                    refreshLibraryUi()
+                                    refreshLibrariesPageUi()
                                 }
                             }
                             .setNegativeButton("إلغاء", null)
@@ -1402,8 +2338,11 @@ class MainActivity : AppCompatActivity() {
                             .setMessage("هل تريد حذف مكتبة \"${lib.name}\" وجميع قنواتها (${lib.channels.size})؟")
                             .setPositiveButton("حذف") { _, _ ->
                                 if (libraryManager.deleteLibrary(lib.id)) {
+                                    if (browsingLibraryId == lib.id) {
+                                        browsingLibraryId = null
+                                    }
                                     selectedLibraryId = libraryManager.getActiveLibrary().id
-                                    refreshLibraryUi()
+                                    refreshLibrariesPageUi()
                                     toast("تم حذف المكتبة.")
                                 }
                             }
@@ -1422,7 +2361,7 @@ class MainActivity : AppCompatActivity() {
             .setMessage("حذف \"${channel.name}\" من مكتبة \"${lib.name}\"؟")
             .setPositiveButton("حذف") { _, _ ->
                 if (libraryManager.deleteChannel(lib.id, index)) {
-                    refreshLibraryUi()
+                    refreshLibrariesPageUi()
                 }
             }
             .setNegativeButton("إلغاء", null)
@@ -1451,15 +2390,73 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // === Styling Helpers ===
+    private fun hideKeyboard() {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        currentFocus?.let { imm.hideSoftInputFromWindow(it.windowToken, 0) }
+    }
 
-    private fun makeCard(): LinearLayout {
+    // =========================================================================
+    // UI STYLING & ANIMATION HELPERS
+    // =========================================================================
+
+    private fun buildPaginationDots(activeIndex: Int): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            gravity = Gravity.CENTER
+            for (i in 0 until 3) {
+                val dot = View(this@MainActivity).apply {
+                    val size = dp(6)
+                    layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                        if (i > 0) marginStart = dp(7)
+                    }
+                    background = roundedDrawable(
+                        fillColor = if (i == activeIndex) Color.WHITE else Color.parseColor("#55FFFFFF"),
+                        strokeColor = Color.TRANSPARENT,
+                        strokeWidthPx = 0,
+                        radiusPx = dp(3).toFloat()
+                    )
+                }
+                addView(dot)
+            }
+        }
+    }
+
+    private fun makeSectionHeading(title: String): TextView {
+        return TextView(this).apply {
+            text = title
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = matchWrap()
+        }
+    }
+
+    private fun makePage2Card(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = roundedDrawable(COLOR_CARD, COLOR_BORDER, dp(1), dp(18).toFloat())
+            setPadding(dp(16), dp(14), dp(16), dp(16))
+            background = roundedDrawable(
+                fillColor = COLOR_PAGE2_CARD,
+                strokeColor = Color.parseColor("#2A2A2A"),
+                strokeWidthPx = dp(1),
+                radiusPx = dp(16).toFloat()
+            )
             layoutParams = matchWrap()
+        }
+    }
+
+    private fun makeSubtleDivider(): View {
+        return View(this).apply {
+            setBackgroundColor(Color.parseColor("#2B2B2B"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(1)
+            ).apply {
+                topMargin = dp(14)
+                bottomMargin = dp(14)
+            }
         }
     }
 
@@ -1479,17 +2476,46 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
             minHeight = dp(heightDp)
             background = rippleButtonDrawable(bgColor, strokeColor, dp(12).toFloat())
+            applySpringTouch(this)
         }
     }
 
     private fun makeSmallOptionChip(label: String, onClick: () -> Unit): TextView {
         return TextView(this).apply {
             text = label
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            minHeight = dp(38)
+            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
             setOnClickListener { onClick() }
+            applySpringTouch(this)
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun applySpringTouch(target: View) {
+        target.setOnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.animate()
+                        .scaleX(0.94f)
+                        .scaleY(0.94f)
+                        .setDuration(80L)
+                        .setInterpolator(LinearInterpolator())
+                        .start()
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.animate()
+                        .scaleX(1.0f)
+                        .scaleY(1.0f)
+                        .setDuration(170L)
+                        .setInterpolator(OvershootInterpolator(1.6f))
+                        .start()
+                }
+            }
+            false
         }
     }
 
@@ -1505,6 +2531,7 @@ class MainActivity : AppCompatActivity() {
     private fun wrapDialogView(view: View): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
             setPadding(dp(20), dp(12), dp(20), dp(4))
             addView(view)
         }
@@ -1538,7 +2565,7 @@ class MainActivity : AppCompatActivity() {
             radiusPx = radiusPx
         )
         return RippleDrawable(
-            ColorStateList.valueOf(Color.parseColor("#30FFFFFF")),
+            ColorStateList.valueOf(Color.parseColor("#33FFFFFF")),
             content,
             null
         )
@@ -1563,7 +2590,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun spaceWeight(weight: Float): View {
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, 0, weight)
+        }
+    }
+
     private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density + 0.5f).toInt()
+    }
+
+    private fun dp(value: Float): Int {
         return (value * resources.displayMetrics.density + 0.5f).toInt()
     }
 
@@ -1571,24 +2608,588 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
+    // =========================================================================
+    // CUSTOM VIEWS: SNAP HORIZONTAL PAGER, PULSE RING ANIMATOR, VECTOR ICONS
+    // =========================================================================
+
+    /**
+     * Zero-dependency 3-page snapping HorizontalScrollView.
+     * Snaps cleanly to Page 0, 1, or 2 based on fling velocity and drag distance,
+     * while letting vertical ScrollViews inside each page scroll smoothly.
+     */
+    private class SnapHorizontalPager(context: Context) : HorizontalScrollView(context) {
+
+        private val container = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            layoutParams = LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT)
+        }
+
+        private val pages = mutableListOf<View>()
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+        private var velocityTracker: VelocityTracker? = null
+        private var downX = 0f
+        private var downY = 0f
+        private var initialPositioned = false
+        private var pendingInitialPage = 1
+
+        var currentPage: Int = 1
+            private set
+
+        var onPageChanged: ((Int) -> Unit)? = null
+
+        init {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFillViewport = true
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            addView(container)
+        }
+
+        fun setPages(pageViews: List<View>, initialPage: Int) {
+            container.removeAllViews()
+            pages.clear()
+            pages.addAll(pageViews)
+            pendingInitialPage = initialPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+            currentPage = pendingInitialPage
+            initialPositioned = false
+
+            val w = if (width > 0) width else resources.displayMetrics.widthPixels
+            for (p in pages) {
+                container.addView(p, LinearLayout.LayoutParams(w, LinearLayout.LayoutParams.MATCH_PARENT))
+            }
+            requestLayout()
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w > 0 && pages.isNotEmpty()) {
+                for (p in pages) {
+                    val lp = p.layoutParams
+                    if (lp.width != w) {
+                        lp.width = w
+                        p.layoutParams = lp
+                    }
+                }
+                val targetPage = if (!initialPositioned) pendingInitialPage else currentPage
+                initialPositioned = true
+                post {
+                    scrollTo(targetPage * w, 0)
+                    currentPage = targetPage
+                    onPageChanged?.invoke(currentPage)
+                }
+            }
+        }
+
+        fun scrollToPage(index: Int, animated: Boolean) {
+            if (pages.isEmpty()) return
+            val clamped = index.coerceIn(0, pages.lastIndex)
+            val pageW = if (width > 0) width else resources.displayMetrics.widthPixels
+            val targetX = clamped * pageW
+            if (animated) {
+                smoothScrollTo(targetX, 0)
+            } else {
+                scrollTo(targetX, 0)
+            }
+            if (currentPage != clamped) {
+                currentPage = clamped
+                onPageChanged?.invoke(currentPage)
+            }
+        }
+
+        override fun fling(velocityX: Int) {
+            // Suppress default free-scrolling fling; snapping is handled on ACTION_UP
+        }
+
+        override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = ev.x
+                    downY = ev.y
+                    velocityTracker?.recycle()
+                    velocityTracker = VelocityTracker.obtain().apply { addMovement(ev) }
+                    return super.onInterceptTouchEvent(ev)
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = abs(ev.x - downX)
+                    val dy = abs(ev.y - downY)
+                    // Let vertical ScrollViews win when vertical movement dominates
+                    if (dy > touchSlop && dy >= dx) {
+                        return false
+                    }
+                    if (dx > touchSlop && dx > dy * 1.15f) {
+                        return super.onInterceptTouchEvent(ev)
+                    }
+                    return false
+                }
+            }
+            return super.onInterceptTouchEvent(ev)
+        }
+
+        @SuppressLint("ClickableViewAccessibility")
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            if (velocityTracker == null) {
+                velocityTracker = VelocityTracker.obtain()
+            }
+            velocityTracker?.addMovement(ev)
+
+            val handled = super.onTouchEvent(ev)
+
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                velocityTracker?.computeCurrentVelocity(1000)
+                val vx = velocityTracker?.xVelocity ?: 0f
+                velocityTracker?.recycle()
+                velocityTracker = null
+
+                val pageW = if (width > 0) width else resources.displayMetrics.widthPixels
+                val dragDelta = ev.x - downX
+                val targetPage = when {
+                    vx < -420f -> currentPage + 1
+                    vx > 420f -> currentPage - 1
+                    abs(dragDelta) > pageW * 0.24f -> {
+                        if (dragDelta < 0f) currentPage + 1 else currentPage - 1
+                    }
+
+                    else -> ((scrollX + pageW * 0.5f) / pageW.toFloat()).toInt()
+                }
+                scrollToPage(targetPage, animated = true)
+            }
+            return handled
+        }
+    }
+
+    /**
+     * Shazam-style concentric ripple rings, ambient radial listening glow, and gentle breathing
+     * scale animation bound to the center 184dp circular sync button.
+     */
+    private class PulseRingView(context: Context) : View(context) {
+
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
+        private var targetCircle: View? = null
+        private var isListening = false
+        private var micLevel = 0f
+        private var phase = 0f
+        private var lastGlowRadius = 0f
+        private var lastGlowListening = false
+
+        private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 3200L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener { anim ->
+                phase = anim.animatedValue as Float
+                updateCircleBreathingScale()
+                invalidate()
+            }
+        }
+
+        fun attachTargetCircle(view: View) {
+            targetCircle = view
+        }
+
+        fun setListening(listening: Boolean) {
+            if (isListening == listening) return
+            isListening = listening
+            val desiredDuration = if (listening) 1450L else 3200L
+            if (animator.duration != desiredDuration) {
+                animator.duration = desiredDuration
+            }
+            invalidate()
+        }
+
+        fun setMicLevel(level: Float) {
+            micLevel = level.coerceIn(0f, 1f)
+        }
+
+        fun resumeAnimation() {
+            if (!animator.isStarted) {
+                animator.start()
+            } else if (animator.isPaused) {
+                animator.resume()
+            }
+        }
+
+        fun pauseAnimation() {
+            if (animator.isRunning) {
+                animator.pause()
+            }
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            resumeAnimation()
+        }
+
+        override fun onDetachedFromWindow() {
+            animator.cancel()
+            super.onDetachedFromWindow()
+        }
+
+        private fun updateCircleBreathingScale() {
+            val target = targetCircle ?: return
+            // Only apply breathing scale when user isn't pressing the circle down
+            if (target.isPressed) return
+            val wave = sin(phase * 2.0 * PI).toFloat()
+            val scale = if (isListening) {
+                1.015f + wave * (0.042f + micLevel * 0.028f)
+            } else {
+                1.008f + wave * 0.022f
+            }
+            target.scaleX = scale
+            target.scaleY = scale
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width * 0.5f
+            val cy = height * 0.5f
+            val maxR = min(cx, cy) * 0.98f
+            val baseR = maxR * 0.59f
+
+            // Ambient radial glow behind the center circle
+            if (lastGlowRadius != maxR || lastGlowListening != isListening) {
+                lastGlowRadius = maxR
+                lastGlowListening = isListening
+                val innerColor = if (isListening) {
+                    Color.parseColor("#660088FF")
+                } else {
+                    Color.parseColor("#1E3A5F99")
+                }
+                val midColor = if (isListening) {
+                    Color.parseColor("#240088FF")
+                } else {
+                    Color.parseColor("#0A1D2F4D")
+                }
+                glowPaint.shader = RadialGradient(
+                    cx,
+                    cy,
+                    maxR,
+                    intArrayOf(innerColor, midColor, Color.TRANSPARENT),
+                    floatArrayOf(0.45f, 0.78f, 1.0f),
+                    Shader.TileMode.CLAMP
+                )
+            }
+            canvas.drawCircle(cx, cy, maxR, glowPaint)
+
+            // Concentric expanding sonar rings
+            val ringCount = if (isListening) 3 else 2
+            val density = resources.displayMetrics.density
+            val baseStroke = (if (isListening) 2.6f else 1.5f) * density
+            val expandSpan = (maxR - baseR) * (if (isListening) (0.95f + micLevel * 0.12f) else 0.78f)
+
+            for (i in 0 until ringCount) {
+                val p = (phase + i.toFloat() / ringCount.toFloat()) % 1f
+                val eased = 1f - (1f - p) * (1f - p)
+                val radius = baseR + expandSpan * eased
+                val fade = (1f - p) * (1f - p)
+
+                if (isListening) {
+                    val alpha = (fade * (165f + micLevel * 65f)).roundToInt().coerceIn(0, 235)
+                    ringPaint.color = Color.argb(alpha, 0, 136, 255)
+                } else {
+                    val alpha = (fade * 52f).roundToInt().coerceIn(0, 60)
+                    ringPaint.color = Color.argb(alpha, 255, 255, 255)
+                }
+                ringPaint.strokeWidth = baseStroke * (1f - eased * 0.45f)
+                canvas.drawCircle(cx, cy, radius, ringPaint)
+            }
+        }
+    }
+
+    private enum class IconType {
+        LIBRARY,
+        DELAY,
+        HEADPHONES,
+        SHAZAM_SYNC,
+        PREV,
+        NEXT,
+        PLAY,
+        PAUSE,
+        MUTE,
+        UNMUTE,
+        OVERLAY,
+        GEAR,
+        MUSIC_NOTE,
+        BACK_LEFT,
+        FORWARD_RIGHT,
+        RESET,
+        PLUS,
+        MORE_VERT
+    }
+
+    /**
+     * Self-contained crisp Canvas/Path vector icons (zero external drawable dependencies).
+     */
+    private class VectorIconView(
+        context: Context,
+        private var iconType: IconType,
+        tintColor: Int
+    ) : View(context) {
+
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = tintColor
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = tintColor
+            style = Paint.Style.FILL
+        }
+
+        private val path = Path()
+        private val rect = RectF()
+
+        fun setIcon(type: IconType, tintColor: Int) {
+            iconType = type
+            strokePaint.color = tintColor
+            fillPaint.color = tintColor
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val s = min(w, h)
+            if (s <= 0f) return
+
+            val ox = (w - s) * 0.5f
+            val oy = (h - s) * 0.5f
+            canvas.save()
+            canvas.translate(ox, oy)
+            path.reset()
+
+            when (iconType) {
+                IconType.LIBRARY -> {
+                    // Person silhouette + small eighth note (matching top-left of screenshot #1)
+                    canvas.drawCircle(s * 0.40f, s * 0.28f, s * 0.16f, fillPaint)
+                    rect.set(s * 0.12f, s * 0.52f, s * 0.68f, s * 0.96f)
+                    canvas.drawArc(rect, 180f, 180f, true, fillPaint)
+                    strokePaint.strokeWidth = s * 0.08f
+                    canvas.drawLine(s * 0.78f, s * 0.46f, s * 0.78f, s * 0.80f, strokePaint)
+                    canvas.drawLine(s * 0.78f, s * 0.46f, s * 0.92f, s * 0.52f, strokePaint)
+                    canvas.drawCircle(s * 0.72f, s * 0.82f, s * 0.09f, fillPaint)
+                }
+
+                IconType.DELAY -> {
+                    // Clean clock / time-shift badge (matching top-right of screenshot #1)
+                    strokePaint.strokeWidth = s * 0.09f
+                    canvas.drawCircle(s * 0.50f, s * 0.50f, s * 0.38f, strokePaint)
+                    canvas.drawLine(s * 0.50f, s * 0.50f, s * 0.50f, s * 0.28f, strokePaint)
+                    canvas.drawLine(s * 0.50f, s * 0.50f, s * 0.69f, s * 0.60f, strokePaint)
+                }
+
+                IconType.HEADPHONES -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    rect.set(s * 0.16f, s * 0.16f, s * 0.84f, s * 0.84f)
+                    canvas.drawArc(rect, 180f, 180f, false, strokePaint)
+                    rect.set(s * 0.11f, s * 0.50f, s * 0.29f, s * 0.84f)
+                    canvas.drawRoundRect(rect, s * 0.08f, s * 0.08f, fillPaint)
+                    rect.set(s * 0.71f, s * 0.50f, s * 0.89f, s * 0.84f)
+                    canvas.drawRoundRect(rect, s * 0.08f, s * 0.08f, fillPaint)
+                }
+
+                IconType.SHAZAM_SYNC -> {
+                    // Bold interlocked Shazam-style dual S-sync arcs
+                    strokePaint.strokeWidth = s * 0.155f
+                    // Upper-left hook curving into center
+                    path.moveTo(s * 0.45f, s * 0.17f)
+                    path.lineTo(s * 0.26f, s * 0.36f)
+                    rect.set(s * 0.14f, s * 0.28f, s * 0.60f, s * 0.74f)
+                    path.arcTo(rect, 135f, -180f, false)
+                    canvas.drawPath(path, strokePaint)
+
+                    // Lower-right hook curving symmetrically into center
+                    path.reset()
+                    path.moveTo(s * 0.55f, s * 0.83f)
+                    path.lineTo(s * 0.74f, s * 0.64f)
+                    rect.set(s * 0.40f, s * 0.26f, s * 0.86f, s * 0.72f)
+                    path.arcTo(rect, -45f, -180f, false)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.PREV -> {
+                    // Left-pointing skip previous (bar + triangle)
+                    rect.set(s * 0.18f, s * 0.22f, s * 0.29f, s * 0.78f)
+                    canvas.drawRoundRect(rect, s * 0.04f, s * 0.04f, fillPaint)
+                    path.moveTo(s * 0.80f, s * 0.22f)
+                    path.lineTo(s * 0.34f, s * 0.50f)
+                    path.lineTo(s * 0.80f, s * 0.78f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+
+                IconType.NEXT -> {
+                    path.moveTo(s * 0.20f, s * 0.22f)
+                    path.lineTo(s * 0.66f, s * 0.50f)
+                    path.lineTo(s * 0.20f, s * 0.78f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    rect.set(s * 0.71f, s * 0.22f, s * 0.82f, s * 0.78f)
+                    canvas.drawRoundRect(rect, s * 0.04f, s * 0.04f, fillPaint)
+                }
+
+                IconType.PLAY -> {
+                    path.moveTo(s * 0.28f, s * 0.18f)
+                    path.lineTo(s * 0.82f, s * 0.50f)
+                    path.lineTo(s * 0.28f, s * 0.82f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+
+                IconType.PAUSE -> {
+                    rect.set(s * 0.24f, s * 0.20f, s * 0.42f, s * 0.80f)
+                    canvas.drawRoundRect(rect, s * 0.06f, s * 0.06f, fillPaint)
+                    rect.set(s * 0.58f, s * 0.20f, s * 0.76f, s * 0.80f)
+                    canvas.drawRoundRect(rect, s * 0.06f, s * 0.06f, fillPaint)
+                }
+
+                IconType.UNMUTE -> {
+                    path.moveTo(s * 0.16f, s * 0.38f)
+                    path.lineTo(s * 0.34f, s * 0.38f)
+                    path.lineTo(s * 0.54f, s * 0.20f)
+                    path.lineTo(s * 0.54f, s * 0.80f)
+                    path.lineTo(s * 0.34f, s * 0.62f)
+                    path.lineTo(s * 0.16f, s * 0.62f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    strokePaint.strokeWidth = s * 0.08f
+                    rect.set(s * 0.50f, s * 0.32f, s * 0.74f, s * 0.68f)
+                    canvas.drawArc(rect, -55f, 110f, false, strokePaint)
+                    rect.set(s * 0.52f, s * 0.20f, s * 0.88f, s * 0.80f)
+                    canvas.drawArc(rect, -55f, 110f, false, strokePaint)
+                }
+
+                IconType.MUTE -> {
+                    path.moveTo(s * 0.14f, s * 0.38f)
+                    path.lineTo(s * 0.32f, s * 0.38f)
+                    path.lineTo(s * 0.52f, s * 0.20f)
+                    path.lineTo(s * 0.52f, s * 0.80f)
+                    path.lineTo(s * 0.32f, s * 0.62f)
+                    path.lineTo(s * 0.14f, s * 0.62f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    strokePaint.strokeWidth = s * 0.09f
+                    canvas.drawLine(s * 0.64f, s * 0.36f, s * 0.86f, s * 0.64f, strokePaint)
+                    canvas.drawLine(s * 0.86f, s * 0.36f, s * 0.64f, s * 0.64f, strokePaint)
+                }
+
+                IconType.OVERLAY -> {
+                    // Picture-in-Picture / Floating window icon
+                    strokePaint.strokeWidth = s * 0.085f
+                    rect.set(s * 0.12f, s * 0.18f, s * 0.88f, s * 0.82f)
+                    canvas.drawRoundRect(rect, s * 0.10f, s * 0.10f, strokePaint)
+                    rect.set(s * 0.46f, s * 0.46f, s * 0.80f, s * 0.74f)
+                    canvas.drawRoundRect(rect, s * 0.06f, s * 0.06f, fillPaint)
+                }
+
+                IconType.GEAR -> {
+                    // Crisp 8-tooth gear matching top-left of screenshot #3
+                    val cx = s * 0.50f
+                    val cy = s * 0.50f
+                    strokePaint.strokeWidth = s * 0.13f
+                    for (i in 0 until 8) {
+                        val angle = i * PI / 4.0
+                        val x1 = cx + (s * 0.27f * cos(angle)).toFloat()
+                        val y1 = cy + (s * 0.27f * sin(angle)).toFloat()
+                        val x2 = cx + (s * 0.40f * cos(angle)).toFloat()
+                        val y2 = cy + (s * 0.40f * sin(angle)).toFloat()
+                        canvas.drawLine(x1, y1, x2, y2, strokePaint)
+                    }
+                    strokePaint.strokeWidth = s * 0.14f
+                    canvas.drawCircle(cx, cy, s * 0.24f, strokePaint)
+                }
+
+                IconType.MUSIC_NOTE -> {
+                    // Beamed double eighth-note matching screenshot #3 cards
+                    strokePaint.strokeWidth = s * 0.10f
+                    canvas.drawLine(s * 0.36f, s * 0.72f, s * 0.36f, s * 0.22f, strokePaint)
+                    canvas.drawLine(s * 0.76f, s * 0.64f, s * 0.76f, s * 0.14f, strokePaint)
+                    path.moveTo(s * 0.32f, s * 0.20f)
+                    path.lineTo(s * 0.81f, s * 0.10f)
+                    path.lineTo(s * 0.81f, s * 0.26f)
+                    path.lineTo(s * 0.32f, s * 0.36f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    canvas.drawCircle(s * 0.26f, s * 0.76f, s * 0.13f, fillPaint)
+                    canvas.drawCircle(s * 0.66f, s * 0.68f, s * 0.13f, fillPaint)
+                }
+
+                IconType.BACK_LEFT -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    path.moveTo(s * 0.62f, s * 0.20f)
+                    path.lineTo(s * 0.32f, s * 0.50f)
+                    path.lineTo(s * 0.62f, s * 0.80f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.FORWARD_RIGHT -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    path.moveTo(s * 0.38f, s * 0.20f)
+                    path.lineTo(s * 0.68f, s * 0.50f)
+                    path.lineTo(s * 0.38f, s * 0.80f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.RESET -> {
+                    strokePaint.strokeWidth = s * 0.095f
+                    rect.set(s * 0.18f, s * 0.18f, s * 0.82f, s * 0.82f)
+                    canvas.drawArc(rect, -45f, 290f, false, strokePaint)
+                    path.moveTo(s * 0.22f, s * 0.18f)
+                    path.lineTo(s * 0.22f, s * 0.40f)
+                    path.lineTo(s * 0.44f, s * 0.40f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.PLUS -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    canvas.drawLine(s * 0.50f, s * 0.20f, s * 0.50f, s * 0.80f, strokePaint)
+                    canvas.drawLine(s * 0.20f, s * 0.50f, s * 0.80f, s * 0.50f, strokePaint)
+                }
+
+                IconType.MORE_VERT -> {
+                    val r = s * 0.085f
+                    canvas.drawCircle(s * 0.50f, s * 0.24f, r, fillPaint)
+                    canvas.drawCircle(s * 0.50f, s * 0.50f, r, fillPaint)
+                    canvas.drawCircle(s * 0.50f, s * 0.76f, r, fillPaint)
+                }
+            }
+            canvas.restore()
+        }
+    }
+
     companion object {
-        private val COLOR_BG = Color.parseColor("#0B1120")
-        private val COLOR_CARD = Color.parseColor("#111827")
-        private val COLOR_SURFACE_ELEVATED = Color.parseColor("#1E293B")
-        private val COLOR_BORDER = Color.parseColor("#2A374C")
-        private val COLOR_ACTIVE_ROW_BG = Color.parseColor("#132A23")
-        private val COLOR_SYNC_BOX_BG = Color.parseColor("#241E12")
-        private val COLOR_ACCENT = Color.parseColor("#22C55E")
-        private val COLOR_ACCENT_DARK = Color.parseColor("#16A34A")
-        private val COLOR_TEXT_ON_ACCENT = Color.parseColor("#04150A")
-        private val COLOR_SKY = Color.parseColor("#38BDF8")
-        private val COLOR_SKY_DARK = Color.parseColor("#0284C7")
-        private val COLOR_SKY_BORDER = Color.parseColor("#4438BDF8")
+        private const val PAGE_LIBRARIES = 0 // Left (Screenshot #3)
+        private const val PAGE_HOME = 1      // Center (Screenshot #1)
+        private const val PAGE_DELAY = 2     // Right (Screenshot #2)
+
+        private val COLOR_HOME_BG = Color.parseColor("#0A0D12")
+        private val COLOR_HERO_IDLE = Color.parseColor("#3A3F47")
+        private val COLOR_SHAZAM_BLUE = Color.parseColor("#0088FF")
+        private val COLOR_HOME_CIRCLE_BTN = Color.parseColor("#232830")
+
+        private val COLOR_DARK_SURFACE_BG = Color.parseColor("#121212")
+        private val COLOR_PAGE2_CARD = Color.parseColor("#1E1E1E")
+        private val COLOR_LIB_CARD_BG = Color.parseColor("#1A1A1A")
+        private val COLOR_LIB_COVER_BG = Color.parseColor("#2C2C2C")
+
+        private val COLOR_ACCENT_BLUE = Color.parseColor("#0A84FF")
+        private val COLOR_ACCENT_GREEN = Color.parseColor("#22C55E")
         private val COLOR_WARNING = Color.parseColor("#FBBF24")
         private val COLOR_WARNING_SOFT = Color.parseColor("#2EFBBF24")
-        private val COLOR_DANGER = Color.parseColor("#EF4444")
-        private val COLOR_TEXT_PRIMARY = Color.parseColor("#F8FAFC")
-        private val COLOR_TEXT_SECONDARY = Color.parseColor("#94A3B8")
-        private val COLOR_TEXT_MUTED = Color.parseColor("#64748B")
+
+        private val COLOR_TEXT_PRIMARY = Color.parseColor("#FFFFFF")
+        private val COLOR_TEXT_SECONDARY = Color.parseColor("#9CA3AF")
+        private val COLOR_GRAY_SUBTITLE = Color.parseColor("#9E9E9E")
+        private val COLOR_TEXT_MUTED = Color.parseColor("#6B7280")
     }
 }
