@@ -2,7 +2,7 @@ name: Build FootSync Radio APK
 
 on:
   push:
-    branches: [ main, master ]
+
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
