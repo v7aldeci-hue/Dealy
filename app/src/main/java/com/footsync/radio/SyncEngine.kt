@@ -39,13 +39,12 @@ interface RadioPcmSource {
 }
 
 /**
- * Callbacks emitted on the main thread during an auto-sync session.
+ * Callbacks emitted on the main thread during an unlimited auto-sync session.
  */
 interface SyncListener {
-    fun onSyncStarted(timeoutSec: Int)
+    fun onSyncStarted()
     fun onProgress(
         elapsedSec: Int,
-        timeoutSec: Int,
         micLevel: Float,
         hasCandidate: Boolean,
         candidateLagSec: Double?,
@@ -56,7 +55,6 @@ interface SyncListener {
 
     fun onCandidateDetected(candidateLagSec: Double, peakZ: Double, marginZ: Double)
     fun onSyncConfirmed(measuredLagSec: Double, peakZ: Double, overlapSec: Double)
-    fun onSyncTimeout(unconfirmedCandidateLagSec: Double?)
     fun onSyncCancelled()
     fun onSyncError(message: String)
 }
@@ -73,7 +71,7 @@ data class CorrelationResult(
 )
 
 /**
- * 40-band spectral-change fingerprinter translated from H0 and adapted to 16 kHz mono:
+ * 40-band spectral-change fingerprinter adapted to 16 kHz mono:
  * - Box-average downsampling to 16 kHz mono
  * - 512-point Hann-windowed radix-2 FFT, hop = 320 samples (20 ms / 50 Hz)
  * - 40 contiguous bands (3 bins/band starting at bin 4 -> ~125 Hz to 3875 Hz)
@@ -192,7 +190,6 @@ internal class SpectralFingerprinter(
             fftIm[rev] = 0f
         }
 
-        // Iterative in-place radix-2 Cooley-Tukey FFT
         var size = 2
         while (size <= FFT_SIZE) {
             val halfSize = size ushr 1
@@ -223,7 +220,6 @@ internal class SpectralFingerprinter(
             size = size shl 1
         }
 
-        // Sum bin power into 40 contiguous bands (3 bins per band starting at bin 4)
         for (b in 0 until NUM_BANDS) {
             val firstBin = START_BIN + b * BINS_PER_BAND
             var bandPower = 0.0
@@ -295,11 +291,11 @@ internal class SpectralFingerprinter(
         const val TARGET_SAMPLE_RATE = 16_000L
         const val HOP_SAMPLES = 320 // 20 ms at 16 kHz
         const val NUM_BANDS = 40
-        private const val START_BIN = 4 // 4 * 31.25 Hz = 125 Hz -> 124 * 31.25 Hz = 3875 Hz
+        private const val START_BIN = 4 // ~125 Hz to 3875 Hz
         private const val BINS_PER_BAND = 3
         private const val HISTORY_FRAMES = 4
         private const val NANOS_PER_SEC = 1_000_000_000L
-        private const val WINDOW_CENTER_OFFSET_NS = 16_000_000L // 256 / 16000 s = 16 ms
+        private const val WINDOW_CENTER_OFFSET_NS = 16_000_000L
         private const val DISCONTINUITY_NS = 30_000_000L
         private const val LOG_EPS = 1e-7
         private const val SILENCE_ENERGY_THRESHOLD = 1e-7
@@ -329,11 +325,8 @@ internal class SpectralFingerprinter(
 }
 
 /**
- * Streaming slot correlator translated from G0 and configured for lags from -30s to +120s
+ * Streaming slot correlator configured for lags from -30s to +120s
  * with a ±1.0s (50-hop) secondary peak exclusion zone.
- *
- * Lag convention: lag = slot_mic - slot_radio
- * Positive lag means TV (mic) is behind radio, so radio must be delayed by +lag.
  */
 internal class StreamingSlotCorrelator {
 
@@ -382,8 +375,6 @@ internal class StreamingSlotCorrelator {
 
         if (!hasMic) return
 
-        // lag = micSlot - radioSlot in [MIN_LAG_HOPS, MAX_LAG_HOPS]
-        // => micSlot in [slot + MIN_LAG_HOPS, slot + MAX_LAG_HOPS]
         val startMic = max(slot + MIN_LAG_HOPS, minMicSlot)
         val endMic = min(slot + MAX_LAG_HOPS, maxMicSlot)
         if (startMic > endMic) return
@@ -424,8 +415,6 @@ internal class StreamingSlotCorrelator {
 
         if (!hasRadio) return
 
-        // lag = micSlot - radioSlot in [MIN_LAG_HOPS, MAX_LAG_HOPS]
-        // => radioSlot in [slot - MAX_LAG_HOPS, slot - MIN_LAG_HOPS]
         val startRadio = max(slot - MAX_LAG_HOPS, minRadioSlot)
         val endRadio = min(slot - MIN_LAG_HOPS, maxRadioSlot)
         if (startRadio > endRadio) return
@@ -500,7 +489,6 @@ internal class StreamingSlotCorrelator {
             }
         }
 
-        // Parabolic sub-hop interpolation clamped to [-0.5, +0.5] hop
         var subHop = 0.0
         if (bestIdx > 0 && bestIdx < LAG_COUNT - 1) {
             val yL = scores[bestIdx - 1]
@@ -533,10 +521,6 @@ internal class StreamingSlotCorrelator {
         )
     }
 
-    /**
-     * Zeroes sums and counts while preserving the spectral history rings so the second
-     * verification pass must accumulate from completely fresh audio.
-     */
     @Synchronized
     fun clearAccumulators() {
         Arrays.fill(sums, 0.0)
@@ -588,7 +572,6 @@ internal class StreamingSlotCorrelator {
         private const val MAX_LAG_HOPS = MAX_LAG_MS / HOP_MS // +6000
         private const val LAG_COUNT = MAX_LAG_HOPS - MIN_LAG_HOPS + 1 // 7501
 
-        // Power-of-two circular buffer covering >327 seconds of 20 ms slots
         private const val RING_SIZE = 16384
         private const val RING_MASK = RING_SIZE - 1
 
@@ -601,7 +584,7 @@ internal class StreamingSlotCorrelator {
 }
 
 /**
- * Double-verification anti-guessing gate translated from I0 and tuned for smartphone microphones:
+ * Double-verification anti-guessing gate tuned for smartphone microphones:
  * - Requires overlap >= 4.0 s, peakZ >= 5.5, and peakZ - secondZ >= 1.8
  * - Clears correlator accumulators immediately on Candidate #1
  * - Confirms when Candidate #2 falls within ±150 ms of Candidate #1 (averaging both lags)
@@ -640,7 +623,6 @@ internal class DoubleVerificationGate {
             confirmCount = 1
         }
 
-        // Immediately zero sums[] and counts[] while preserving spectral history rings
         correlator.clearAccumulators()
 
         return if (confirmCount >= 2) {
@@ -660,7 +642,7 @@ internal class DoubleVerificationGate {
 
 /**
  * On-demand 40-band spectral auto-sync engine for smartphone microphones.
- * Zero FFT or mic work runs outside an active sync session.
+ * Runs continuously with NO time limit until double-verification confirms a match or [cancel] is called.
  */
 class SyncEngine(
     private val radioSource: RadioPcmSource,
@@ -688,8 +670,7 @@ class SyncEngine(
     val isRunning: Boolean
         get() = running.get()
 
-    fun start(timeoutSec: Int = DEFAULT_TIMEOUT_SEC) {
-        val clampedTimeout = timeoutSec.coerceIn(15, 120)
+    fun start() {
         synchronized(sessionLock) {
             if (!running.compareAndSet(false, true)) return
 
@@ -697,7 +678,6 @@ class SyncEngine(
             val radioQueue = ArrayBlockingQueue<PcmChunk>(RADIO_QUEUE_CAPACITY)
             val micQueue = ArrayBlockingQueue<PcmChunk>(MIC_QUEUE_CAPACITY)
 
-            // Register live radio tap BEFORE reading history so no samples are missed at the boundary
             radioSource.setLivePcmTap { pcm, frameCount, channels, sampleRate, startTimeNs ->
                 if (!running.get() || frameCount <= 0) return@setLivePcmTap
                 val totalShorts = frameCount * channels
@@ -706,7 +686,7 @@ class SyncEngine(
                 radioQueue.offer(PcmChunk(copy, frameCount, channels, sampleRate, startTimeNs))
             }
 
-            mainHandler.post { listener.onSyncStarted(clampedTimeout) }
+            mainHandler.post { listener.onSyncStarted() }
 
             val micWorker = Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
@@ -715,7 +695,7 @@ class SyncEngine(
 
             val dspWorker = Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE)
-                runDspSyncLoop(clampedTimeout, radioQueue, micQueue)
+                runDspSyncLoop(radioQueue, micQueue)
             }, "FootSync-DspWorker")
 
             micThread = micWorker
@@ -862,7 +842,6 @@ class SyncEngine(
                     }
                 }
 
-                // Smooth monotonic clock anchor so consecutive mic frames never drift or jitter >30ms
                 if (anchorTimeNs == Long.MIN_VALUE) {
                     anchorTimeNs = measuredStartNs -
                         (totalFramesRead * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
@@ -881,7 +860,6 @@ class SyncEngine(
                     (totalFramesRead * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
                 totalFramesRead += read.toLong()
 
-                // Compute normalized RMS level for live mic meter
                 var sumSq = 0.0
                 for (i in 0 until read) {
                     val v = readBuffer[i].toDouble() / 32768.0
@@ -912,7 +890,6 @@ class SyncEngine(
     }
 
     private fun runDspSyncLoop(
-        timeoutSec: Int,
         radioQueue: ArrayBlockingQueue<PcmChunk>,
         micQueue: ArrayBlockingQueue<PcmChunk>
     ) {
@@ -927,7 +904,6 @@ class SyncEngine(
         }
 
         val sessionStartNs = System.nanoTime()
-        val timeoutNs = timeoutSec.toLong() * NANOS_PER_SEC
 
         // 1. Pre-populate radio spectral ring from delay buffer history (100 ms chunks)
         var lastHistoryEndNs = Long.MIN_VALUE
@@ -955,7 +931,6 @@ class SyncEngine(
             while (running.get() && !Thread.currentThread().isInterrupted) {
                 var didWork = false
 
-                // Drain available live radio chunks (skipping overlap already loaded from history)
                 while (running.get()) {
                     val rChunk = radioQueue.poll() ?: break
                     val endNs = rChunk.startTimeNs +
@@ -974,7 +949,6 @@ class SyncEngine(
                     didWork = true
                 }
 
-                // Drain available mic chunks
                 while (running.get()) {
                     val mChunk = micQueue.poll() ?: break
                     micFingerprinter.feed(
@@ -1024,32 +998,27 @@ class SyncEngine(
                             }
                         }
 
-                        is DoubleVerificationGate.Decision.None -> {
-                            // Continue listening
-                        }
+                        is DoubleVerificationGate.Decision.None -> Unit
                     }
 
-                    val elapsedSec = (elapsedNs / NANOS_PER_SEC).toInt().coerceAtMost(timeoutSec)
+                    val elapsedSec = (elapsedNs / NANOS_PER_SEC).toInt().coerceAtLeast(0)
                     val hasCand = gate.confirmCount > 0 && !gate.candidateLagMs.isNaN()
                     val candSec = if (hasCand) gate.candidateLagMs / 1000.0 else null
                     val statusText = if (hasCand && candSec != null) {
                         String.format(
                             Locale.US,
-                            "تم رصد مرشّح %.1f ث • يتأكد على صوت جديد… (%d/%d ث)",
-                            candSec,
-                            elapsedSec,
-                            timeoutSec
+                            "تم رصد مرشّح %.1f ث • يتأكد على صوت جديد…",
+                            candSec
                         )
                     } else if (latestMicRms < 0.03f && elapsedSec >= 3) {
-                        "صوت التلفزيون منخفض جداً • قرّب الهاتف من التلفزيون ($elapsedSec/$timeoutSec ث)"
+                        "صوت التلفزيون منخفض جداً • قرّب الهاتف من التلفزيون"
                     } else {
-                        "جاري الاستماع لصوت التلفزيون والمطابقة… ($elapsedSec/$timeoutSec ث)"
+                        "جاري الاستماع لصوت التلفزيون والمطابقة…"
                     }
 
                     mainHandler.post {
                         listener.onProgress(
                             elapsedSec = elapsedSec,
-                            timeoutSec = timeoutSec,
                             micLevel = latestMicRms,
                             hasCandidate = hasCand,
                             candidateLagSec = candSec,
@@ -1060,21 +1029,7 @@ class SyncEngine(
                     }
                 }
 
-                if (elapsedNs >= timeoutNs) {
-                    val unconfirmedSec = if (gate.confirmCount == 1 && !gate.candidateLagMs.isNaN()) {
-                        gate.candidateLagMs / 1000.0
-                    } else {
-                        null
-                    }
-                    stopInternal()
-                    mainHandler.post {
-                        listener.onSyncTimeout(unconfirmedSec)
-                    }
-                    return
-                }
-
                 if (!didWork) {
-                    // Brief wait for next mic chunk without busy-spinning
                     val waited = micQueue.poll(15L, TimeUnit.MILLISECONDS)
                     if (waited != null && running.get()) {
                         micFingerprinter.feed(
@@ -1100,6 +1055,7 @@ class SyncEngine(
     }
 
     companion object {
+        // Retained for backward compatibility with FootSyncPrefs in LibraryManager.kt
         const val DEFAULT_TIMEOUT_SEC = 60
         private const val MIC_SAMPLE_RATE = 16_000
         private const val MIC_READ_FRAMES = 640 // 40 ms chunks at 16 kHz
