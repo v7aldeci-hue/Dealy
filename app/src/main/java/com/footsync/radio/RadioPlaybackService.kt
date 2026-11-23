@@ -11,6 +11,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
@@ -35,19 +37,23 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ProtocolException
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
@@ -99,7 +105,8 @@ data class ServiceUiState(
 
 /**
  * Circular PCM ring buffer supporting up to 180 seconds of live delay (185s capacity)
- * with glitch-free cosine crossfade transitions and monotonic speaker-aligned timestamping.
+ * with zero-allocation hot path, strict frame alignment, direct pass-through at 0ms delay,
+ * glitch-free cosine crossfade transitions, and monotonic speaker-aligned timestamping.
  */
 @OptIn(UnstableApi::class)
 class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
@@ -111,11 +118,15 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     private var capacityFrames = 48_000 * BUFFER_CAPACITY_SECONDS
     private var ringBuffer = ShortArray(0)
 
+    // Pre-allocated working buffer (allocated once in onConfigure; zero allocations in queueInput)
+    private var scratchIn = ShortArray(0)
+    private var maxScratchFrames = 0
+
     private var totalFramesWritten = 0L
     private var anchorZeroDelayNs = Long.MIN_VALUE
 
     @Volatile
-    private var requestedDelaySec = 0.0
+    private var requestedDelayMs = 0L
     private var activeDelayFrames = 0L
     private var previousDelayFrames = 0L
     private var crossfadeRemaining = 0
@@ -127,13 +138,12 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     @Volatile
     private var liveTap: ((ShortArray, Int, Int, Int, Long) -> Unit)? = null
 
-    private var scratchIn = ShortArray(0)
-
     fun setDelaySeconds(seconds: Double) {
-        requestedDelaySec = seconds.coerceIn(0.0, MAX_DELAY_SECONDS)
+        val clamped = seconds.coerceIn(0.0, MAX_DELAY_SECONDS)
+        requestedDelayMs = (clamped * 1000.0).roundToLong()
     }
 
-    fun getDelaySeconds(): Double = requestedDelaySec
+    fun getDelaySeconds(): Double = requestedDelayMs.toDouble() / 1000.0
 
     fun updateOutputLatencyNs(latencyNs: Long) {
         if (latencyNs in 0L..MAX_SINK_LATENCY_NS) {
@@ -156,8 +166,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         totalFramesWritten = 0L
         anchorZeroDelayNs = Long.MIN_VALUE
         crossfadeRemaining = 0
-        activeDelayFrames = (requestedDelaySec * sampleRate.toDouble()).roundToLong()
-            .coerceIn(0L, maxDelayFramesLocked())
+        activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
         previousDelayFrames = activeDelayFrames
     }
 
@@ -182,31 +191,37 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
             capacityFrames = sampleRate * BUFFER_CAPACITY_SECONDS
             if (needRealloc) {
                 ringBuffer = ShortArray(capacityFrames * channelCount)
+                // Pre-allocate 1 full second of PCM scratch space so queueInput never allocates
+                maxScratchFrames = sampleRate
+                scratchIn = ShortArray(maxScratchFrames * channelCount)
             }
             totalFramesWritten = 0L
             anchorZeroDelayNs = Long.MIN_VALUE
-            activeDelayFrames = (requestedDelaySec * sampleRate.toDouble()).roundToLong()
-                .coerceIn(0L, maxDelayFramesLocked())
+            activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
             previousDelayFrames = activeDelayFrames
             crossfadeRemaining = 0
-            crossfadeTotal = (sampleRate / 100).coerceIn(64, 1024) // ~10 ms crossfade
+            crossfadeTotal = (sampleRate / 100).coerceIn(64, 1024)
         }
+
+        // Pre-warm BaseAudioProcessor's internal output ByteBuffer to avoid runtime allocations
+        val prewarmBytes = (sampleRate / 4) * channelCount * 2
+        replaceOutputBuffer(prewarmBytes).flip()
 
         return AudioProcessor.AudioFormat(newSr, newCh, C.ENCODING_PCM_16BIT)
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remainingBytes = inputBuffer.remaining()
-        if (remainingBytes <= 0) return
+        val frameSize = channelCount * 2
+        if (remainingBytes < frameSize || frameSize <= 0) return
 
-        val bytesPerFrame = channelCount * 2
-        val frameCount = remainingBytes / bytesPerFrame
+        // Strictly align byte count to frameSize = channelCount * 2 and cap to pre-allocated scratch
+        val maxFrames = if (maxScratchFrames > 0) maxScratchFrames else (remainingBytes / frameSize)
+        val frameCount = min(remainingBytes / frameSize, maxFrames)
         if (frameCount <= 0) return
 
+        val alignedBytes = frameCount * frameSize
         val totalShorts = frameCount * channelCount
-        if (scratchIn.size < totalShorts) {
-            scratchIn = ShortArray(totalShorts)
-        }
 
         val srcOrder = inputBuffer.order()
         inputBuffer.order(ByteOrder.LITTLE_ENDIAN)
@@ -215,7 +230,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         }
         inputBuffer.order(srcOrder)
 
-        val outBuf = replaceOutputBuffer(totalShorts * 2)
+        val outBuf = replaceOutputBuffer(alignedBytes)
         outBuf.order(ByteOrder.LITTLE_ENDIAN)
 
         val nowNs = System.nanoTime()
@@ -258,9 +273,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
             chunkStartTimeNs = anchorZeroDelayNs +
                 (totalFramesWritten * NANOS_PER_SEC) / sampleRate.toLong()
 
-            // Check if user requested a new delay value
-            val targetDelayFrames = (requestedDelaySec * sampleRate.toDouble()).roundToLong()
-                .coerceIn(0L, maxDelayFramesLocked())
+            val delayMs = requestedDelayMs
+            val targetDelayFrames = delayMsToFramesLocked(delayMs)
             if (targetDelayFrames != activeDelayFrames) {
                 previousDelayFrames = activeDelayFrames
                 activeDelayFrames = targetDelayFrames
@@ -268,38 +282,53 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                 crossfadeRemaining = crossfadeTotal
             }
 
-            // Write incoming undelayed PCM into ring buffer and emit delayed PCM
-            val oldestAvailableAfterWrite = max(0L, (totalFramesWritten + frameCount) - cap)
-            for (f in 0 until frameCount) {
-                val writeFrame = totalFramesWritten
-                val writeRingSlot = (writeFrame % cap).toInt()
-                val writeBase = writeRingSlot * channelCount
-                val inBase = f * channelCount
-                for (c in 0 until channelCount) {
-                    ringBuffer[writeBase + c] = scratchIn[inBase + c]
-                }
-                totalFramesWritten++
-
-                val newReadFrame = writeFrame - activeDelayFrames
-                if (crossfadeRemaining > 0) {
-                    val oldReadFrame = writeFrame - previousDelayFrames
-                    val progress = 1.0 - (crossfadeRemaining.toDouble() / crossfadeTotal.toDouble())
-                    val fadeIn = (0.5 - 0.5 * cos(PI * progress)).toFloat()
-                    val fadeOut = 1.0f - fadeIn
-                    crossfadeRemaining--
-
+            // Fast, glitch-free pass-through when delayMs == 0L and no crossfade is active
+            if (delayMs == 0L && activeDelayFrames == 0L && crossfadeRemaining == 0) {
+                for (f in 0 until frameCount) {
+                    val writeSlot = (totalFramesWritten % cap).toInt()
+                    val writeBase = writeSlot * channelCount
+                    val inBase = f * channelCount
                     for (c in 0 until channelCount) {
-                        val sOld = readSampleLocked(oldReadFrame, oldestAvailableAfterWrite, c)
-                        val sNew = readSampleLocked(newReadFrame, oldestAvailableAfterWrite, c)
-                        val mixed = (sOld * fadeOut + sNew * fadeIn)
-                            .toInt()
-                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                            .toShort()
-                        outBuf.putShort(mixed)
+                        val s = scratchIn[inBase + c]
+                        ringBuffer[writeBase + c] = s
+                        outBuf.putShort(s)
                     }
-                } else {
+                    totalFramesWritten++
+                }
+            } else {
+                // Write incoming undelayed PCM first, then read delayed frame (read pointer <= write pointer)
+                for (f in 0 until frameCount) {
+                    val writeFrame = totalFramesWritten
+                    val writeSlot = (writeFrame % cap).toInt()
+                    val writeBase = writeSlot * channelCount
+                    val inBase = f * channelCount
                     for (c in 0 until channelCount) {
-                        outBuf.putShort(readSampleLocked(newReadFrame, oldestAvailableAfterWrite, c))
+                        ringBuffer[writeBase + c] = scratchIn[inBase + c]
+                    }
+                    totalFramesWritten++
+                    val oldestAvailable = max(0L, totalFramesWritten - cap)
+
+                    val newReadFrame = writeFrame - activeDelayFrames
+                    if (crossfadeRemaining > 0) {
+                        val oldReadFrame = writeFrame - previousDelayFrames
+                        val progress = 1.0 - (crossfadeRemaining.toDouble() / crossfadeTotal.toDouble())
+                        val fadeIn = (0.5 - 0.5 * cos(PI * progress)).toFloat()
+                        val fadeOut = 1.0f - fadeIn
+                        crossfadeRemaining--
+
+                        for (c in 0 until channelCount) {
+                            val sOld = readSampleLocked(oldReadFrame, oldestAvailable, c)
+                            val sNew = readSampleLocked(newReadFrame, oldestAvailable, c)
+                            val mixed = (sOld * fadeOut + sNew * fadeIn)
+                                .toInt()
+                                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                                .toShort()
+                            outBuf.putShort(mixed)
+                        }
+                    } else {
+                        for (c in 0 until channelCount) {
+                            outBuf.putShort(readSampleLocked(newReadFrame, oldestAvailable, c))
+                        }
                     }
                 }
             }
@@ -321,6 +350,12 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         return ringBuffer[slot * channelCount + channel]
     }
 
+    private fun delayMsToFramesLocked(delayMs: Long): Long {
+        if (delayMs <= 0L) return 0L
+        val rawFrames = (delayMs * sampleRate.toLong()) / 1000L
+        return rawFrames.coerceIn(0L, maxDelayFramesLocked())
+    }
+
     private fun maxDelayFramesLocked(): Long {
         return min(
             (MAX_DELAY_SECONDS * sampleRate.toDouble()).roundToLong(),
@@ -340,6 +375,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
             anchorZeroDelayNs = Long.MIN_VALUE
             crossfadeRemaining = 0
             ringBuffer = ShortArray(0)
+            scratchIn = ShortArray(0)
+            maxScratchFrames = 0
         }
     }
 
@@ -423,8 +460,9 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
 }
 
 /**
- * Wraps Media3 [DefaultAudioSink] to continuously measure real AudioTrack / Bluetooth output
- * latency via [AudioSink.getCurrentPositionUs] and feed monotonic timing into [DelayAudioProcessor].
+ * Wraps Media3 [DefaultAudioSink] to enforce an AudioTrack buffer size of at least 4x
+ * [AudioTrack.getMinBufferSize] (preventing underruns/stuttering) and continuously measure
+ * real AudioTrack / Bluetooth output latency for [DelayAudioProcessor].
  */
 @OptIn(UnstableApi::class)
 class SyncAudioSink(
@@ -440,12 +478,23 @@ class SyncAudioSink(
         specifiedBufferSize: Int,
         outputChannels: IntArray?
     ) {
-        if (inputFormat.sampleRate > 0) {
-            lastSampleRate = inputFormat.sampleRate
-        }
+        val sr = if (inputFormat.sampleRate > 0) inputFormat.sampleRate else 48_000
         val ch = if (inputFormat.channelCount > 0) inputFormat.channelCount else 2
+        lastSampleRate = sr
         lastPcmFrameSize = ch * 2
-        delegate.configure(inputFormat, specifiedBufferSize, outputChannels)
+
+        val channelConfig = when (ch) {
+            1 -> AudioFormat.CHANNEL_OUT_MONO
+            2 -> AudioFormat.CHANNEL_OUT_STEREO
+            else -> AudioFormat.CHANNEL_OUT_STEREO
+        }
+
+        val minBuf = AudioTrack.getMinBufferSize(sr, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
+        val fourXMinBuf = if (minBuf > 0) minBuf * 4 else (sr * lastPcmFrameSize) / 2
+        val rawTarget = max(specifiedBufferSize, fourXMinBuf)
+        val alignedBufferSize = ((rawTarget + lastPcmFrameSize - 1) / lastPcmFrameSize) * lastPcmFrameSize
+
+        delegate.configure(inputFormat, alignedBufferSize, outputChannels)
     }
 
     override fun handleBuffer(
@@ -474,9 +523,8 @@ class SyncAudioSink(
 }
 
 /**
- * Lightweight local raw-socket HTTP relay for legacy ICY/Shoutcast radio streams.
- * Converts `ICY 200 OK` into valid HTTP/1.1 headers for ExoPlayer while tracking live KB/s.
- * Automatically signals fallback for HLS playlists or unsupported upstream responses.
+ * Fallback raw-socket HTTP relay used ONLY when ExoPlayer fails on legacy ICY/invalid-HTTP-header
+ * Shoutcast servers. Uses 16384-byte buffered streams to prevent socket stutter.
  */
 class StreamRelay(
     private val onBytesTransferred: (Int) -> Unit
@@ -490,14 +538,9 @@ class StreamRelay(
     @Volatile
     private var targetUrl: String = ""
 
-    @Volatile
-    var lastErrorSuggestsDirectFallback: Boolean = false
-        private set
-
     fun start(upstreamUrl: String): String {
         stop()
         targetUrl = upstreamUrl.trim()
-        lastErrorSuggestsDirectFallback = false
 
         val server = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
         server.reuseAddress = true
@@ -544,11 +587,11 @@ class StreamRelay(
     private fun handleClient(client: Socket, initialUrl: String) {
         var upstream: Socket? = null
         try {
-            client.soTimeout = 12_000
+            client.soTimeout = 15_000
             client.tcpNoDelay = true
+            client.sendBufferSize = RELAY_BUFFER_BYTES
 
-            // Drain incoming ExoPlayer HTTP request headers
-            val clientIn = BufferedInputStream(client.getInputStream())
+            val clientIn = BufferedInputStream(client.getInputStream(), RELAY_BUFFER_BYTES)
             drainHttpRequest(clientIn)
 
             var currentUrl = initialUrl
@@ -590,7 +633,7 @@ class StreamRelay(
                 out.write(req.toByteArray(StandardCharsets.US_ASCII))
                 out.flush()
 
-                val uIn = BufferedInputStream(sock.getInputStream(), 16 * 1024)
+                val uIn = BufferedInputStream(sock.getInputStream(), RELAY_BUFFER_BYTES)
                 statusLine = readAsciiLine(uIn)
                 headers = readHeaders(uIn)
 
@@ -623,23 +666,12 @@ class StreamRelay(
                 upperStatus.contains(" 206")
 
             if (!isOk) {
-                lastErrorSuggestsDirectFallback = true
                 writeErrorResponse(client.getOutputStream(), 502)
                 return
             }
 
-            val rawContentType = headers["content-type"]?.lowercase(Locale.US) ?: ""
-            if (rawContentType.contains("mpegurl") ||
-                rawContentType.contains("dash+xml") ||
-                currentUrl.lowercase(Locale.US).contains(".m3u8")
-            ) {
-                lastErrorSuggestsDirectFallback = true
-                writeErrorResponse(client.getOutputStream(), 415)
-                return
-            }
-
             val contentType = headers["content-type"]?.takeIf { it.isNotBlank() } ?: "audio/mpeg"
-            val clientOut = client.getOutputStream()
+            val clientOut = BufferedOutputStream(client.getOutputStream(), RELAY_BUFFER_BYTES)
             val responseHeader = buildString {
                 append("HTTP/1.1 200 OK\r\n")
                 append("Content-Type: ").append(contentType).append("\r\n")
@@ -649,18 +681,18 @@ class StreamRelay(
             clientOut.write(responseHeader.toByteArray(StandardCharsets.US_ASCII))
             clientOut.flush()
 
-            val buf = ByteArray(16 * 1024)
+            val buf = ByteArray(RELAY_BUFFER_BYTES)
             while (running.get() && !client.isClosed) {
                 val n = uIn.read(buf)
                 if (n < 0) break
                 if (n > 0) {
                     clientOut.write(buf, 0, n)
+                    clientOut.flush()
                     onBytesTransferred(n)
                 }
             }
             clientOut.flush()
         } catch (_: Throwable) {
-            lastErrorSuggestsDirectFallback = true
         } finally {
             closeSocketQuietly(upstream)
             closeSocketQuietly(client)
@@ -669,7 +701,8 @@ class StreamRelay(
 
     private fun openUpstreamSocket(host: String, port: Int, isHttps: Boolean): Socket {
         val raw = Socket()
-        raw.connect(InetSocketAddress(host, port), 8_000)
+        raw.receiveBufferSize = RELAY_BUFFER_BYTES * 2
+        raw.connect(InetSocketAddress(host, port), 15_000)
         raw.soTimeout = 15_000
         raw.tcpNoDelay = true
         if (!isHttps) return raw
@@ -740,15 +773,7 @@ class StreamRelay(
     }
 
     companion object {
-        fun shouldUseDirectExoPlayer(url: String): Boolean {
-            val lower = url.trim().lowercase(Locale.US)
-            return lower.contains(".m3u8") ||
-                lower.contains(".mpd") ||
-                lower.startsWith("rtsp://") ||
-                lower.startsWith("rtmp://") ||
-                lower.contains("format=m3u8") ||
-                lower.contains("hls")
-        }
+        private const val RELAY_BUFFER_BYTES = 16_384
     }
 }
 
@@ -769,9 +794,9 @@ class ServiceRestartReceiver : BroadcastReceiver() {
 }
 
 /**
- * Dedicated background mediaPlayback Foreground Service hosting ExoPlayer, the 180s PCM delay
- * ring buffer, local ICY stream relay with direct fallback, auto-reconnect, on-demand SyncEngine,
- * persistent Arabic notification, and touch FloatingOverlayController.
+ * Dedicated background mediaPlayback Foreground Service hosting ExoPlayer (direct HTTP/HTTPS/HLS
+ * first, ICY relay fallback only on invalid HTTP/ICY header errors), 180s PCM delay ring buffer,
+ * auto-reconnect, on-demand SyncEngine, persistent Arabic notification, and FloatingOverlayController.
  */
 @OptIn(UnstableApi::class)
 class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
@@ -806,8 +831,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     private var isMuted = false
     private var mutedBeforeSync = false
     private var autoMutedBySync = false
-    private var useRelayForCurrentAttempt = false
-    private var relayFailedForCurrentUrl = false
+    private var useRelayForCurrentUrl = false
     private var reconnectBackoffMs = INITIAL_RECONNECT_MS
     private var playbackHealthySinceMs = 0L
 
@@ -887,7 +911,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
     override fun onCreate() {
         super.onCreate()
-        libraryManager = LibraryManager(this)
+        libraryManager = LibraryManager.getInstance(applicationContext)
         prefs = FootSyncPrefs(this)
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
@@ -989,7 +1013,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         delayProcessor.setDelaySeconds(savedDelay)
         if (!isSameUrl) {
             delayProcessor.clearHistory()
-            relayFailedForCurrentUrl = false
+            // Always try direct ExoPlayer first on every new URL
+            useRelayForCurrentUrl = false
         }
 
         reconnectBackoffMs = INITIAL_RECONNECT_MS
@@ -1437,12 +1462,21 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("FootSyncRadio/1.0 (Android)")
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(10_000)
+            .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(15_000)
             .setTransferListener(directTransferListener)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(this)
             .setDataSourceFactory(httpFactory)
+
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                15_000, // minBufferMs
+                50_000, // maxBufferMs
+                2_500,  // bufferForPlaybackMs
+                5_000   // bufferForPlaybackAfterRebufferMs
+            )
+            .build()
 
         val audioAttributes = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
@@ -1451,6 +1485,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
         val exo = ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
+            .setLoadControl(loadControl)
             .build()
 
         // handleAudioFocus = false so incoming phone notifications never pause or break the delay ring
@@ -1465,7 +1500,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                         updateState {
                             it.copy(
                                 isBuffering = true,
-                                connectionStatus = if (useRelayForCurrentAttempt) {
+                                connectionStatus = if (useRelayForCurrentUrl) {
                                     "جاري التخزين (ICY)…"
                                 } else {
                                     "جاري التخزين المؤقت…"
@@ -1482,8 +1517,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                                 it.copy(
                                     isPlaying = true,
                                     isBuffering = false,
-                                    usingRelay = useRelayForCurrentAttempt,
-                                    connectionStatus = if (useRelayForCurrentAttempt) {
+                                    usingRelay = useRelayForCurrentUrl,
+                                    connectionStatus = if (useRelayForCurrentUrl) {
                                         "متصل (ICY Relay)"
                                     } else {
                                         "متصل (مباشر)"
@@ -1508,17 +1543,19 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                 if (!shouldStayAlive || userStopped) return
                 playbackHealthySinceMs = 0L
 
-                // If legacy ICY relay failed, immediately fall back to direct ExoPlayer/HLS
-                if (useRelayForCurrentAttempt && !relayFailedForCurrentUrl) {
-                    relayFailedForCurrentUrl = true
-                    streamRelay.stop()
-                    val target = currentTarget
-                    if (target != null) {
+                val target = currentTarget
+                // ONLY fall back to StreamRelay if direct ExoPlayer failed with an ICY/invalid-HTTP-header error
+                if (!useRelayForCurrentUrl && target != null && isIcyOrInvalidHttpHeaderError(error)) {
+                    val lowerUrl = target.channel.url.trim().lowercase(Locale.US)
+                    if ((lowerUrl.startsWith("http://") || lowerUrl.startsWith("https://")) &&
+                        !lowerUrl.contains(".m3u8")
+                    ) {
+                        useRelayForCurrentUrl = true
                         updateState {
                             it.copy(
                                 isBuffering = true,
-                                usingRelay = false,
-                                connectionStatus = "التحويل إلى التشغيل المباشر…"
+                                usingRelay = true,
+                                connectionStatus = "التحويل إلى وضع ICY Relay…"
                             )
                         }
                         startStreamForTarget(target, isReconnect = true)
@@ -1533,29 +1570,50 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         player = exo
     }
 
+    private fun isIcyOrInvalidHttpHeaderError(error: PlaybackException): Boolean {
+        var cause: Throwable? = error
+        var depth = 0
+        while (cause != null && depth < 10) {
+            if (cause is ProtocolException) return true
+            val msg = cause.message?.lowercase(Locale.US) ?: ""
+            if (msg.contains("icy") ||
+                msg.contains("unexpected status line") ||
+                msg.contains("invalid status line") ||
+                msg.contains("malformed status") ||
+                msg.contains("bad status") ||
+                msg.contains("invalid http")
+            ) {
+                return true
+            }
+            if (cause is HttpDataSource.InvalidResponseCodeException && cause.responseCode <= 0) {
+                return true
+            }
+            cause = cause.cause
+            depth++
+        }
+        return false
+    }
+
     private fun startStreamForTarget(target: PlaybackTarget, isReconnect: Boolean) {
         val exo = player ?: return
         val rawUrl = target.channel.url.trim()
         streamRelay.stop()
 
-        val preferDirect = relayFailedForCurrentUrl || StreamRelay.shouldUseDirectExoPlayer(rawUrl)
-        val playableUrl = if (preferDirect) {
-            useRelayForCurrentAttempt = false
-            rawUrl
-        } else {
+        val playableUrl = if (useRelayForCurrentUrl) {
             try {
-                useRelayForCurrentAttempt = true
                 streamRelay.start(rawUrl)
             } catch (_: Throwable) {
-                useRelayForCurrentAttempt = false
-                relayFailedForCurrentUrl = true
+                useRelayForCurrentUrl = false
                 rawUrl
             }
+        } else {
+            // Direct ExoPlayer for all HTTP/HTTPS/HLS (.m3u8) streams
+            rawUrl
         }
 
         updateState {
             it.copy(
-                usingRelay = useRelayForCurrentAttempt,
+                usingRelay = useRelayForCurrentUrl,
                 isBuffering = true,
                 connectionStatus = if (isReconnect) {
                     "إعادة الاتصال…"
@@ -1620,7 +1678,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     private fun acquireLocks() {
         try {
             if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(4L * 60L * 60L * 1000L) // Up to 4 hours per match session
+                wakeLock?.acquire(4L * 60L * 60L * 1000L)
             }
         } catch (_: Throwable) {
         }
