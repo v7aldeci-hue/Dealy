@@ -1,17 +1,18 @@
 package com.footsync.radio
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTimestamp
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import java.util.Arrays
 import java.util.Locale
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.abs
@@ -23,23 +24,21 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Provides historical and live undelayed radio PCM (timestamped to zero-delay speaker output time)
- * to [SyncEngine] strictly on demand while an auto-sync session is active.
+ * Cursor-based access to the undelayed radio PCM circular buffer (exact mirror of Lu0/k0 + Lu0/L0).
  */
 interface RadioPcmSource {
-    fun readHistoryChunks(
-        maxDurationMs: Long,
-        chunkMs: Int,
-        consumer: (pcm: ShortArray, frameCount: Int, channels: Int, sampleRate: Int, startTimeNs: Long) -> Unit
-    )
-
-    fun setLivePcmTap(
-        tap: ((pcm: ShortArray, frameCount: Int, channels: Int, sampleRate: Int, startTimeNs: Long) -> Unit)?
-    )
+    /**
+     * Returns [anchorWriteTimeNs, sampleRate, channelCount, generationId], or null if no audio is active.
+     */
+    fun getStreamAnchor(): LongArray?
+    fun getOldestFrameIndex(): Long
+    fun getCurrentWriteFrameIndex(): Long
+    fun getOutputLatencyNs(): Long
+    fun readFramesAt(startFrame: Long, dest: ShortArray, frameCount: Int): Int
 }
 
 /**
- * Callbacks emitted on the main thread during a continuous (no-timeout) auto-sync session.
+ * Callbacks emitted on the main thread during a phone-mode auto-sync session (exact Lu0/h0 flow).
  */
 interface SyncListener {
     fun onSyncStarted()
@@ -54,13 +53,19 @@ interface SyncListener {
     )
 
     fun onCandidateDetected(candidateLagSec: Double, peakZ: Double, marginZ: Double)
-    fun onSyncConfirmed(measuredLagSec: Double, peakZ: Double, overlapSec: Double)
+
+    /**
+     * [effectiveLagMs] = outputLatencyMs + rawLagMs (exact Lu0/h0 + LG/l sign convention):
+     * - effectiveLagMs <= 20.0 -> TV is behind radio; radio should be delayed by max(0, round(-effectiveLagMs)) ms.
+     * - effectiveLagMs > 20.0  -> Radio is behind TV by effectiveLagMs ms.
+     */
+    fun onSyncConfirmed(effectiveLagMs: Double, peakZ: Double, overlapSec: Double)
     fun onSyncCancelled()
     fun onSyncError(message: String)
 }
 
 /**
- * Evaluation snapshot produced by [StreamingSlotCorrelator].
+ * Exact 1:1 translation of Lu0/F0.
  */
 data class CorrelationResult(
     val valid: Boolean = false,
@@ -71,12 +76,13 @@ data class CorrelationResult(
 )
 
 /**
- * 40-band spectral-change fingerprinter translated from H0 and adapted to 16 kHz mono:
- * - Box-average downsampling to 16 kHz mono
- * - 512-point Hann-windowed radix-2 FFT, hop = 320 samples (20 ms / 50 Hz)
- * - 40 contiguous bands (3 bins/band starting at bin 4 -> ~125 Hz to 3875 Hz)
- * - Log power + energy silence gate (> 1e-7)
- * - 4-frame temporal contrast + across-band mean removal + EMA RMS normalization + [-3, +3] clamp
+ * Exact 1:1 copy of Lu0/H0:
+ * - Box-average downsampling to 8,000 Hz mono (0x1f40)
+ * - 512-point Hann-windowed radix-2 FFT, hop = 160 samples (20 ms / 50 Hz)
+ * - 40 contiguous bands, 3 bins/band starting at bin 6 (~94 Hz to ~1969 Hz)
+ * - Log power + energy silence gate (> 1.0E-7)
+ * - 4-frame temporal contrast + across-band mean removal + EMA RMS normalization (alpha = 0.005) + [-3, +3] clamp
+ * - Center timestamp offset = 32,000,000 ns (0x1e84800)
  */
 internal class SpectralFingerprinter(
     private val onFrame: (centerTimeNs: Long, features: FloatArray) -> Unit
@@ -128,7 +134,8 @@ internal class SpectralFingerprinter(
         if (frameCount <= 0 || sampleRate <= 0 || channels <= 0) return
 
         if (sampleRate != lastSampleRate ||
-            (lastEndTimeNs != Long.MIN_VALUE && abs(startTimeNs - lastEndTimeNs) > DISCONTINUITY_NS)
+            lastEndTimeNs == Long.MIN_VALUE ||
+            abs(startTimeNs - lastEndTimeNs) > DISCONTINUITY_NS
         ) {
             reset()
             lastSampleRate = sampleRate
@@ -139,16 +146,10 @@ internal class SpectralFingerprinter(
 
         for (frame in 0 until frameCount) {
             val base = frame * channels
-            val monoSample = when (channels) {
-                1 -> samples[base].toDouble()
-                2 -> (samples[base].toInt() + samples[base + 1].toInt()) * 0.5
-                else -> {
-                    var sumCh = 0.0
-                    for (c in 0 until channels) {
-                        sumCh += samples[base + c].toDouble()
-                    }
-                    sumCh / channels.toDouble()
-                }
+            val monoSample = if (channels == 1) {
+                samples[base].toDouble()
+            } else {
+                (samples[base].toInt() + samples[base + 1].toInt()).toDouble() * 0.5
             }
 
             downsampleSum += monoSample
@@ -162,7 +163,7 @@ internal class SpectralFingerprinter(
                 downsampleCount = 0L
 
                 sampleRing[ringWriteIdx] = normalized
-                ringWriteIdx = (ringWriteIdx + 1) and FFT_MASK
+                ringWriteIdx = (ringWriteIdx + 1) % FFT_SIZE
                 if (ringFilled < FFT_SIZE) {
                     ringFilled++
                 }
@@ -183,7 +184,8 @@ internal class SpectralFingerprinter(
     private fun processFftFrame() {
         var energySum = 0.0
         for (i in 0 until FFT_SIZE) {
-            val x = sampleRing[(ringWriteIdx + i) and FFT_MASK]
+            val idx = (ringWriteIdx + i) % FFT_SIZE
+            val x = sampleRing[idx]
             energySum += (x * x).toDouble()
             val rev = BIT_REV[i]
             fftRe[rev] = x * HANN_WINDOW[i]
@@ -221,8 +223,8 @@ internal class SpectralFingerprinter(
         }
 
         for (b in 0 until NUM_BANDS) {
-            val firstBin = START_BIN + b * BINS_PER_BAND
             var bandPower = 0.0
+            val firstBin = b * BINS_PER_BAND + START_BIN
             for (j in 0 until BINS_PER_BAND) {
                 val bin = firstBin + j
                 val re = fftRe[bin]
@@ -237,13 +239,11 @@ internal class SpectralFingerprinter(
         if (historyCount == HISTORY_FRAMES && isNonSilent) {
             var acrossBandSum = 0.0
             for (b in 0 until NUM_BANDS) {
-                val prevMean = (
-                    history[0][b] +
-                        history[1][b] +
-                        history[2][b] +
-                        history[3][b]
-                    ) * 0.25f
-                val diff = logBands[b] - prevMean
+                var histSum = 0f
+                for (h in 0 until HISTORY_FRAMES) {
+                    histSum += history[h][b]
+                }
+                val diff = logBands[b] - (histSum / 4.0f)
                 features[b] = diff
                 acrossBandSum += diff.toDouble()
             }
@@ -266,15 +266,14 @@ internal class SpectralFingerprinter(
             val scale = (1.0 / sqrt(emaVar + RMS_EPS)).toFloat()
             for (b in 0 until NUM_BANDS) {
                 val scaled = features[b] * scale
-                features[b] = scaled.coerceIn(-CLAMP_LIMIT, CLAMP_LIMIT)
+                features[b] = max(-CLAMP_LIMIT, min(CLAMP_LIMIT, scaled))
             }
 
-            val centerTimeNs = lastSampleTimeNs - WINDOW_CENTER_OFFSET_NS
-            onFrame(centerTimeNs, features)
+            onFrame(lastSampleTimeNs - WINDOW_CENTER_OFFSET_NS, features)
         }
 
         System.arraycopy(logBands, 0, history[historyWriteIdx], 0, NUM_BANDS)
-        historyWriteIdx = (historyWriteIdx + 1) and 3
+        historyWriteIdx = (historyWriteIdx + 1) % HISTORY_FRAMES
         if (isNonSilent) {
             if (historyCount < HISTORY_FRAMES) {
                 historyCount++
@@ -286,33 +285,32 @@ internal class SpectralFingerprinter(
 
     companion object {
         const val FFT_SIZE = 512
-        private const val FFT_MASK = FFT_SIZE - 1
-        private const val HALF_FFT = FFT_SIZE / 2
-        const val TARGET_SAMPLE_RATE = 16_000L
-        const val HOP_SAMPLES = 320
+        private const val HALF_FFT = 256
+        const val TARGET_SAMPLE_RATE = 8_000L
+        const val HOP_SAMPLES = 160
         const val NUM_BANDS = 40
-        private const val START_BIN = 4
+        private const val START_BIN = 6
         private const val BINS_PER_BAND = 3
         private const val HISTORY_FRAMES = 4
         private const val NANOS_PER_SEC = 1_000_000_000L
-        private const val WINDOW_CENTER_OFFSET_NS = 16_000_000L
+        private const val WINDOW_CENTER_OFFSET_NS = 32_000_000L
         private const val DISCONTINUITY_NS = 30_000_000L
-        private const val LOG_EPS = 1e-7
-        private const val SILENCE_ENERGY_THRESHOLD = 1e-7
+        private const val LOG_EPS = 1.0e-7
+        private const val SILENCE_ENERGY_THRESHOLD = 1.0e-7
         private const val EMA_ALPHA = 0.005
-        private const val RMS_EPS = 1e-6
+        private const val RMS_EPS = 1.0e-6
         private const val CLAMP_LIMIT = 3.0f
 
         private val HANN_WINDOW = FloatArray(FFT_SIZE) { i ->
-            (0.5 - 0.5 * cos(2.0 * PI * i / (FFT_SIZE - 1).toDouble())).toFloat()
+            (0.5 - 0.5 * cos(2.0 * PI * i.toDouble() / 511.0)).toFloat()
         }
 
         private val COS_TABLE = FloatArray(HALF_FFT) { i ->
-            cos(2.0 * PI * i / FFT_SIZE.toDouble()).toFloat()
+            cos(2.0 * PI * i.toDouble() / 512.0).toFloat()
         }
 
         private val SIN_TABLE = FloatArray(HALF_FFT) { i ->
-            (-sin(2.0 * PI * i / FFT_SIZE.toDouble())).toFloat()
+            (-sin(2.0 * PI * i.toDouble() / 512.0)).toFloat()
         }
 
         private val BIT_REV = IntArray(FFT_SIZE).apply {
@@ -325,106 +323,75 @@ internal class SpectralFingerprinter(
 }
 
 /**
- * Streaming slot correlator translated from G0 and configured for lags from -30s to +120s
- * with a ±1.0s (50-hop) secondary peak exclusion zone.
+ * Exact 1:1 copy of Lu0/G0:
+ * - Symmetric lag window ±3100 hops (±62,000 ms)
+ * - Ring size = 8192 slots (mask = 8191)
+ * - Secondary peak exclusion = 6 hops (±120 ms)
+ * - Lag convention: lag = radioSlot - micSlot
  */
 internal class StreamingSlotCorrelator {
 
-    private val radioVecs = FloatArray(RING_SIZE * NUM_BANDS)
     private val micVecs = FloatArray(RING_SIZE * NUM_BANDS)
-    private val radioSlots = LongArray(RING_SIZE)
+    private val radioVecs = FloatArray(RING_SIZE * NUM_BANDS)
     private val micSlots = LongArray(RING_SIZE)
+    private val radioSlots = LongArray(RING_SIZE)
 
     private val sums = DoubleArray(LAG_COUNT)
     private val scores = DoubleArray(LAG_COUNT)
     private val scratch = DoubleArray(LAG_COUNT)
     private val counts = IntArray(LAG_COUNT)
 
-    private var hasRadio = false
-    private var minRadioSlot = Long.MAX_VALUE
-    private var maxRadioSlot = Long.MIN_VALUE
-
-    private var hasMic = false
-    private var minMicSlot = Long.MAX_VALUE
-    private var maxMicSlot = Long.MIN_VALUE
-
     init {
         resetAll()
     }
 
     @Synchronized
-    fun addRadioFrame(timeNs: Long, vec: FloatArray) {
-        val slot = quantizeSlot(timeNs)
-        val ringIdx = (slot and RING_MASK.toLong()).toInt()
-        if (radioSlots[ringIdx] == slot) return
-
-        val ownOffset = ringIdx * NUM_BANDS
-        System.arraycopy(vec, 0, radioVecs, ownOffset, NUM_BANDS)
-        radioSlots[ringIdx] = slot
-
-        if (!hasRadio) {
-            hasRadio = true
-            minRadioSlot = slot
-            maxRadioSlot = slot
-        } else {
-            if (slot < minRadioSlot) minRadioSlot = slot
-            if (slot > maxRadioSlot) maxRadioSlot = slot
-            val oldestKeepable = maxRadioSlot - (RING_SIZE - 1)
-            if (minRadioSlot < oldestKeepable) minRadioSlot = oldestKeepable
-        }
-
-        if (!hasMic) return
-
-        val startMic = max(slot + MIN_LAG_HOPS, minMicSlot)
-        val endMic = min(slot + MAX_LAG_HOPS, maxMicSlot)
-        if (startMic > endMic) return
-
-        var otherSlot = startMic
-        while (otherSlot <= endMic) {
-            val otherIdx = (otherSlot and RING_MASK.toLong()).toInt()
-            if (micSlots[otherIdx] == otherSlot) {
-                val dot = dot40(radioVecs, ownOffset, micVecs, otherIdx * NUM_BANDS)
-                val lagIdx = (otherSlot - slot).toInt() - MIN_LAG_HOPS
-                sums[lagIdx] += dot.toDouble()
-                counts[lagIdx]++
-            }
-            otherSlot++
-        }
+    fun addMicFrame(timeNs: Long, vec: FloatArray) {
+        addFrame(timeNs, vec, micVecs, micSlots, radioVecs, radioSlots, isMic = true)
     }
 
     @Synchronized
-    fun addMicFrame(timeNs: Long, vec: FloatArray) {
-        val slot = quantizeSlot(timeNs)
-        val ringIdx = (slot and RING_MASK.toLong()).toInt()
-        if (micSlots[ringIdx] == slot) return
+    fun addRadioFrame(timeNs: Long, vec: FloatArray) {
+        addFrame(timeNs, vec, radioVecs, radioSlots, micVecs, micSlots, isMic = false)
+    }
+
+    private fun addFrame(
+        timeNs: Long,
+        vec: FloatArray,
+        ownVecs: FloatArray,
+        ownSlots: LongArray,
+        otherVecs: FloatArray,
+        otherSlots: LongArray,
+        isMic: Boolean
+    ) {
+        val slot = floorDiv(timeNs + HALF_SLOT_NS, SLOT_NS)
+        val mask = RING_MASK.toLong()
+        val ringIdx = (slot and mask).toInt()
+        if (ownSlots[ringIdx] == slot) return
 
         val ownOffset = ringIdx * NUM_BANDS
-        System.arraycopy(vec, 0, micVecs, ownOffset, NUM_BANDS)
-        micSlots[ringIdx] = slot
+        System.arraycopy(vec, 0, ownVecs, ownOffset, NUM_BANDS)
+        ownSlots[ringIdx] = slot
 
-        if (!hasMic) {
-            hasMic = true
-            minMicSlot = slot
-            maxMicSlot = slot
-        } else {
-            if (slot < minMicSlot) minMicSlot = slot
-            if (slot > maxMicSlot) maxMicSlot = slot
-            val oldestKeepable = maxMicSlot - (RING_SIZE - 1)
-            if (minMicSlot < oldestKeepable) minMicSlot = oldestKeepable
-        }
-
-        if (!hasRadio) return
-
-        val startRadio = max(slot - MAX_LAG_HOPS, minRadioSlot)
-        val endRadio = min(slot - MIN_LAG_HOPS, maxRadioSlot)
-        if (startRadio > endRadio) return
-
-        var otherSlot = startRadio
-        while (otherSlot <= endRadio) {
-            val otherIdx = (otherSlot and RING_MASK.toLong()).toInt()
-            if (radioSlots[otherIdx] == otherSlot) {
-                val dot = dot40(micVecs, ownOffset, radioVecs, otherIdx * NUM_BANDS)
-                val lagIdx = (slot - otherSlot).toInt() - MIN_LAG_HOPS
+        val maxLag = MAX_LAG_HOPS.toLong()
+        var otherSlot = slot - maxLag
+        val endSlot = slot + maxLag
+        while (otherSlot <= endSlot) {
+            val otherIdx = (otherSlot and mask).toInt()
+            if (otherSlots[otherIdx] == otherSlot) {
+                val otherOffset = otherIdx * NUM_BANDS
+                var dot = 0f
+                var b = 0
+                while (b < NUM_BANDS) {
+                    dot += ownVecs[ownOffset + b] * otherVecs[otherOffset + b]
+                    b++
+                }
+                val lagHops = if (isMic) {
+                    (otherSlot - slot).toInt()
+                } else {
+                    (slot - otherSlot).toInt()
+                }
+                val lagIdx = lagHops + MAX_LAG_HOPS
                 sums[lagIdx] += dot.toDouble()
                 counts[lagIdx]++
             }
@@ -464,8 +431,8 @@ internal class StreamingSlotCorrelator {
         Arrays.sort(scratch, 0, validCount)
         val mad = MAD_SCALE * scratch[validCount / 2] + MAD_EPS
 
-        val startIdx = max(0, (minLagMs / HOP_MS) - MIN_LAG_HOPS)
-        val endIdx = min(LAG_COUNT - 1, (maxLagMs / HOP_MS) - MIN_LAG_HOPS)
+        val startIdx = max(0, (minLagMs / HOP_MS) + MAX_LAG_HOPS)
+        val endIdx = min(LAG_COUNT - 1, (maxLagMs / HOP_MS) + MAX_LAG_HOPS)
 
         var bestIdx = -1
         for (i in startIdx..endIdx) {
@@ -497,13 +464,12 @@ internal class StreamingSlotCorrelator {
             if (!yL.isNaN() && !yR.isNaN()) {
                 val denom = yL - 2.0 * yC + yR
                 if (denom < 0.0) {
-                    subHop = (0.5 * (yL - yR) / denom).coerceIn(-0.5, 0.5)
+                    subHop = max(-0.5, min(0.5, 0.5 * (yL - yR) / denom))
                 }
             }
         }
 
-        val lagHops = (bestIdx + MIN_LAG_HOPS).toDouble() + subHop
-        val lagMs = lagHops * HOP_MS.toDouble()
+        val lagMs = ((bestIdx - MAX_LAG_HOPS).toDouble() + subHop) * 20.0
         val peakZ = (scores[bestIdx] - med) / mad
         val secondZ = if (secondBestScore == Double.NEGATIVE_INFINITY) {
             0.0
@@ -530,34 +496,16 @@ internal class StreamingSlotCorrelator {
     @Synchronized
     fun resetAll() {
         clearAccumulators()
-        Arrays.fill(radioSlots, Long.MIN_VALUE)
         Arrays.fill(micSlots, Long.MIN_VALUE)
-        hasRadio = false
-        minRadioSlot = Long.MAX_VALUE
-        maxRadioSlot = Long.MIN_VALUE
-        hasMic = false
-        minMicSlot = Long.MAX_VALUE
-        maxMicSlot = Long.MIN_VALUE
+        Arrays.fill(radioSlots, Long.MIN_VALUE)
     }
 
-    private fun quantizeSlot(timeNs: Long): Long {
-        return Math.floorDiv(timeNs + HALF_SLOT_NS, SLOT_NS)
-    }
-
-    private fun dot40(a: FloatArray, aOff: Int, b: FloatArray, bOff: Int): Float {
-        var s0 = 0f
-        var s1 = 0f
-        var s2 = 0f
-        var s3 = 0f
-        var i = 0
-        while (i < NUM_BANDS) {
-            s0 += a[aOff + i] * b[bOff + i]
-            s1 += a[aOff + i + 1] * b[bOff + i + 1]
-            s2 += a[aOff + i + 2] * b[bOff + i + 2]
-            s3 += a[aOff + i + 3] * b[bOff + i + 3]
-            i += 4
+    private fun floorDiv(x: Long, y: Long): Long {
+        var q = x / y
+        if ((x xor y) < 0L && q * y != x) {
+            q--
         }
-        return (s0 + s1) + (s2 + s3)
+        return q
     }
 
     companion object {
@@ -566,25 +514,29 @@ internal class StreamingSlotCorrelator {
         private const val SLOT_NS = 20_000_000L
         private const val HALF_SLOT_NS = 10_000_000L
 
-        const val MIN_LAG_MS = -30_000
-        const val MAX_LAG_MS = 120_000
-        private const val MIN_LAG_HOPS = MIN_LAG_MS / HOP_MS
-        private const val MAX_LAG_HOPS = MAX_LAG_MS / HOP_MS
-        private const val LAG_COUNT = MAX_LAG_HOPS - MIN_LAG_HOPS + 1
+        const val MAX_LAG_HOPS = 3100
+        const val MIN_LAG_MS = -62_000
+        const val MAX_LAG_MS = 62_000
+        private const val LAG_COUNT = MAX_LAG_HOPS * 2 + 1
 
-        private const val RING_SIZE = 16384
+        private const val RING_SIZE = 8192
         private const val RING_MASK = RING_SIZE - 1
 
         private const val MIN_COUNT_HOPS = 100
         private const val MIN_VALID_LAGS = 200
-        private const val EXCLUSION_HOPS = 50
+        private const val EXCLUSION_HOPS = 6
         private const val MAD_SCALE = 1.4826
-        private const val MAD_EPS = 1e-9
+        private const val MAD_EPS = 1.0e-9
     }
 }
 
 /**
- * Double-verification anti-guessing gate translated from I0 and tuned for smartphone microphones.
+ * Exact 1:1 copy of Lu0/I0:
+ * - peakZ >= 7.0
+ * - peakZ - secondZ >= 2.5
+ * - overlapSec >= 4.0
+ * - 2 consecutive detections within 60.0 ms
+ * - Calls correlator.clearAccumulators() after each qualifying detection
  */
 internal class DoubleVerificationGate {
     sealed class Decision {
@@ -630,75 +582,49 @@ internal class DoubleVerificationGate {
     }
 
     companion object {
+        private const val MIN_PEAK_Z = 7.0
+        private const val MIN_MARGIN_Z = 2.5
         private const val MIN_OVERLAP_SEC = 4.0
-        private const val MIN_PEAK_Z = 5.5
-        private const val MIN_MARGIN_Z = 1.8
-        private const val CONFIRM_TOLERANCE_MS = 150.0
+        private const val CONFIRM_TOLERANCE_MS = 60.0
     }
 }
 
 /**
- * On-demand 40-band spectral auto-sync engine for smartphone microphones.
- * Runs continuously with NO timeout limit until double-verified or cancelled manually.
+ * Exact 1:1 copy of the phone-mode sync engine (Lu0/h0 + LG/l case 0xf + Lu0/d0):
+ * - 48,000 Hz mono AudioRecord using UNPROCESSED (only when supported) else VOICE_RECOGNITION
+ * - Single-thread mic read + radio circular-buffer pull loop (zero TV loopback code)
+ * - Direct hardware AudioTimestamp (TIMEBASE_MONOTONIC) with min-anchor fallback
+ * - Exact 300-sample-peak silence detector (3s window)
+ * - Evaluates every 1.0s over [-62s, +62s] with exact 60-second timeout (0xdf8475800L ns)
  */
 class SyncEngine(
+    private val appContext: Context,
     private val radioSource: RadioPcmSource,
     private val listener: SyncListener
 ) {
-    private data class PcmChunk(
-        val pcm: ShortArray,
-        val frameCount: Int,
-        val channels: Int,
-        val sampleRate: Int,
-        val startTimeNs: Long
-    )
-
     private val mainHandler = Handler(Looper.getMainLooper())
     private val running = AtomicBoolean(false)
     private val sessionLock = Any()
 
-    private var micThread: Thread? = null
-    private var dspThread: Thread? = null
+    private var workerThread: Thread? = null
     @Volatile
     private var activeAudioRecord: AudioRecord? = null
-    @Volatile
-    private var latestMicRms: Float = 0f
 
     val isRunning: Boolean
         get() = running.get()
 
-    fun start() {
+    fun start(muteDrainWaitMs: Long = 0L) {
         synchronized(sessionLock) {
             if (!running.compareAndSet(false, true)) return
 
-            latestMicRms = 0f
-            val radioQueue = ArrayBlockingQueue<PcmChunk>(RADIO_QUEUE_CAPACITY)
-            val micQueue = ArrayBlockingQueue<PcmChunk>(MIC_QUEUE_CAPACITY)
-
-            radioSource.setLivePcmTap { pcm, frameCount, channels, sampleRate, startTimeNs ->
-                if (!running.get() || frameCount <= 0) return@setLivePcmTap
-                val totalShorts = frameCount * channels
-                val copy = ShortArray(totalShorts)
-                System.arraycopy(pcm, 0, copy, 0, totalShorts)
-                radioQueue.offer(PcmChunk(copy, frameCount, channels, sampleRate, startTimeNs))
-            }
-
             mainHandler.post { listener.onSyncStarted() }
 
-            val micWorker = Thread({
+            val thread = Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-                runMicCaptureLoop(micQueue)
-            }, "FootSync-MicCapture")
-
-            val dspWorker = Thread({
-                Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE)
-                runDspSyncLoop(radioQueue, micQueue)
-            }, "FootSync-DspWorker")
-
-            micThread = micWorker
-            dspThread = dspWorker
-            micWorker.start()
-            dspWorker.start()
+                runSyncSession(muteDrainWaitMs.coerceIn(0L, 600L))
+            }, "FootSync-MicSync")
+            workerThread = thread
+            thread.start()
         }
     }
 
@@ -706,28 +632,12 @@ class SyncEngine(
         val wasRunning = running.getAndSet(false)
         if (!wasRunning) return
 
-        radioSource.setLivePcmTap(null)
         stopAudioRecordSafely()
-
         synchronized(sessionLock) {
-            micThread?.interrupt()
-            dspThread?.interrupt()
-            micThread = null
-            dspThread = null
+            workerThread?.interrupt()
+            workerThread = null
         }
-
         mainHandler.post { listener.onSyncCancelled() }
-    }
-
-    private fun stopInternal() {
-        running.set(false)
-        radioSource.setLivePcmTap(null)
-        stopAudioRecordSafely()
-        synchronized(sessionLock) {
-            micThread?.interrupt()
-            micThread = null
-            dspThread = null
-        }
     }
 
     private fun stopAudioRecordSafely() {
@@ -747,234 +657,204 @@ class SyncEngine(
         }
     }
 
+    /**
+     * Exact copy of Lu0/h0.d():
+     * Uses UNPROCESSED (9) ONLY when SUPPORT_AUDIO_SOURCE_UNPROCESSED == "true", else VOICE_RECOGNITION (6),
+     * at 48,000 Hz mono PCM16, buffer = max(minBuf, 19200).
+     */
     @SuppressLint("MissingPermission")
-    private fun createAudioRecord(): AudioRecord? {
-        val minBufBytes = AudioRecord.getMinBufferSize(
+    private fun openAudioRecord(): AudioRecord {
+        var audioSource = MediaRecorder.AudioSource.VOICE_RECOGNITION
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val am = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val prop = am?.getProperty("android.media.property.SUPPORT_AUDIO_SOURCE_UNPROCESSED")
+            if ("true" == prop) {
+                audioSource = MediaRecorder.AudioSource.UNPROCESSED
+            }
+        }
+
+        val minBuf = AudioRecord.getMinBufferSize(
             MIC_SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        if (minBufBytes <= 0) return null
-        val bufferBytes = max(minBufBytes * 4, MIC_READ_FRAMES * 2 * 8)
-
-        val preferredSources = intArrayOf(
-            MediaRecorder.AudioSource.UNPROCESSED,
-            MediaRecorder.AudioSource.MIC
-        )
-
-        for (source in preferredSources) {
-            var candidate: AudioRecord? = null
-            try {
-                candidate = AudioRecord(
-                    source,
-                    MIC_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferBytes
-                )
-                if (candidate.state == AudioRecord.STATE_INITIALIZED) {
-                    candidate.startRecording()
-                    if (candidate.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                        return candidate
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-            try {
-                candidate?.release()
-            } catch (_: Throwable) {
-            }
+        if (minBuf <= 0) {
+            throw SyncException("المايك ما يدعم القياس على هذا الجهاز")
         }
-        return null
+
+        val bufSize = max(minBuf, MIN_RECORD_BUFFER_BYTES)
+        val record = try {
+            AudioRecord(
+                audioSource,
+                MIC_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufSize
+            )
+        } catch (_: SecurityException) {
+            throw SyncException("اسمح للتطبيق باستخدام المايك ثم اضغط مرة ثانية")
+        }
+
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            throw SyncException("تعذر فتح المايك")
+        }
+        return record
     }
 
-    private fun runMicCaptureLoop(micQueue: ArrayBlockingQueue<PcmChunk>) {
-        val record = createAudioRecord()
-        if (record == null) {
-            if (running.get()) {
-                stopInternal()
-                mainHandler.post {
-                    listener.onSyncError("تعذّر فتح ميكروفون الهاتف. تأكد من منح إذن الميكروفون.")
-                }
-            }
-            return
-        }
-
-        activeAudioRecord = record
-        val readBuffer = ShortArray(MIC_READ_FRAMES)
-        val audioTimestamp = AudioTimestamp()
-        var totalFramesRead = 0L
-        var anchorTimeNs = Long.MIN_VALUE
-
+    private fun runSyncSession(muteDrainWaitMs: Long) {
+        var record: AudioRecord? = null
         try {
+            val anchorInfo = radioSource.getStreamAnchor()
+                ?: throw SyncException("شغّل الصوتية أولاً ثم اضغط قياس")
+
+            val anchorWriteTimeNs = anchorInfo[0]
+            val radioSampleRate = anchorInfo[1].toInt()
+            val radioChannels = anchorInfo[2].toInt()
+            val streamGeneration = anchorInfo[3]
+
+            if (radioSampleRate <= 0 || radioChannels <= 0) {
+                throw SyncException("شغّل الصوتية أولاً ثم اضغط قياس")
+            }
+
+            if (muteDrainWaitMs > 0L) {
+                Thread.sleep(muteDrainWaitMs)
+            }
+            if (!running.get() || Thread.currentThread().isInterrupted) {
+                return
+            }
+
+            record = openAudioRecord()
+            activeAudioRecord = record
+
+            val correlator = StreamingSlotCorrelator()
+            val gate = DoubleVerificationGate()
+            val micFingerprinter = SpectralFingerprinter { centerTimeNs, vec ->
+                correlator.addMicFrame(centerTimeNs, vec)
+            }
+            val radioFingerprinter = SpectralFingerprinter { centerTimeNs, vec ->
+                correlator.addRadioFrame(centerTimeNs, vec)
+            }
+
+            // Start 64 seconds back in the radio circular buffer (exact LG/l line 133: 64.0 * sampleRate)
+            val oldestFrame = radioSource.getOldestFrameIndex()
+            val currentWriteFrame = radioSource.getCurrentWriteFrameIndex()
+            val historyBackFrames = (radioSampleRate.toDouble() * HISTORY_LOOKBACK_SEC).toLong()
+            var radioCursor = max(oldestFrame, currentWriteFrame - historyBackFrames)
+
+            record.startRecording()
+            if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw SyncException("المايك مشغول بتطبيق ثاني")
+            }
+
+            val micBuf = ShortArray(MIC_READ_SAMPLES)
+            val radioChunkFrames = max(1, radioSampleRate / 10)
+            var radioReadBuf = ShortArray(radioChunkFrames * radioChannels)
+            val audioTimestamp = AudioTimestamp()
+
+            val sessionStartNs = System.nanoTime()
+            var lastEvalNs = sessionStartNs
+            var lastLoudTimeNs = 0L
+            var totalMicFrames = 0L
+            var fallbackMinAnchorNs = Long.MAX_VALUE
+            var smoothedMicLevel = 0f
+
             while (running.get() && !Thread.currentThread().isInterrupted) {
-                val read = record.read(readBuffer, 0, readBuffer.size)
+                val read = record.read(micBuf, 0, MIC_READ_SAMPLES)
                 if (read <= 0) {
-                    if (read < 0 && running.get()) {
-                        Thread.sleep(10)
-                    }
-                    continue
+                    if (!running.get()) return
+                    throw SyncException("المايك توقف ($read)")
                 }
 
                 val nowNs = System.nanoTime()
-                val chunkDurationNs = (read.toLong() * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
-                val fallbackStartNs = nowNs - chunkDurationNs
 
-                var measuredStartNs = fallbackStartNs
-                val tsStatus = try {
-                    record.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
-                } catch (_: Throwable) {
-                    AudioRecord.ERROR_INVALID_OPERATION
+                // Verify the radio stream did not stop or switch mid-sync (exact Lu0/h0.c lines 60-72)
+                val liveAnchor = radioSource.getStreamAnchor()
+                if (liveAnchor == null || liveAnchor[3] != streamGeneration) {
+                    throw SyncException("توقفت الصوتية أو تغيّرت أثناء القياس")
                 }
 
-                if (tsStatus == AudioRecord.SUCCESS &&
-                    audioTimestamp.nanoTime > 0L &&
-                    audioTimestamp.framePosition > 0L
+                // Exact Lu0/h0.c mic timestamp calculation
+                val micChunkStartNs: Long
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                    record.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS &&
+                    audioTimestamp.nanoTime > 0L
                 ) {
-                    val deltaFrames = totalFramesRead - audioTimestamp.framePosition
-                    val tsStartNs = audioTimestamp.nanoTime +
-                        (deltaFrames * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
-                    if (abs(tsStartNs - fallbackStartNs) < 400_000_000L) {
-                        measuredStartNs = tsStartNs
-                    }
-                }
-
-                if (anchorTimeNs == Long.MIN_VALUE) {
-                    anchorTimeNs = measuredStartNs -
-                        (totalFramesRead * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
+                    micChunkStartNs = audioTimestamp.nanoTime +
+                        ((totalMicFrames - audioTimestamp.framePosition) * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
                 } else {
-                    val predictedStartNs = anchorTimeNs +
-                        (totalFramesRead * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
-                    val errorNs = measuredStartNs - predictedStartNs
-                    anchorTimeNs += if (abs(errorNs) > 150_000_000L) {
-                        errorNs
-                    } else {
-                        errorNs / 25L
+                    val candAnchor = nowNs -
+                        (((totalMicFrames + read.toLong()) * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong())
+                    if (fallbackMinAnchorNs == Long.MAX_VALUE || candAnchor < fallbackMinAnchorNs) {
+                        fallbackMinAnchorNs = candAnchor
                     }
+                    micChunkStartNs = fallbackMinAnchorNs +
+                        (totalMicFrames * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
                 }
 
-                val chunkStartNs = anchorTimeNs +
-                    (totalFramesRead * NANOS_PER_SEC) / MIC_SAMPLE_RATE.toLong()
-                totalFramesRead += read.toLong()
+                totalMicFrames += read.toLong()
 
-                var sumSq = 0.0
+                // Exact Lu0/h0.c peak detector (> 300 -> loud)
+                var peakAbs = 0
                 for (i in 0 until read) {
-                    val v = readBuffer[i].toDouble() / 32768.0
-                    sumSq += v * v
+                    val a = abs(micBuf[i].toInt())
+                    if (a > peakAbs) peakAbs = a
                 }
-                val rms = sqrt(sumSq / read.toDouble()).toFloat()
-                latestMicRms = (latestMicRms * 0.65f + (rms * 4.5f).coerceIn(0f, 1f) * 0.35f)
-
-                val copy = ShortArray(read)
-                System.arraycopy(readBuffer, 0, copy, 0, read)
-                if (!micQueue.offer(PcmChunk(copy, read, 1, MIC_SAMPLE_RATE, chunkStartNs))) {
-                    micQueue.poll()
-                    micQueue.offer(PcmChunk(copy, read, 1, MIC_SAMPLE_RATE, chunkStartNs))
+                if (peakAbs > LOUD_PEAK_THRESHOLD) {
+                    lastLoudTimeNs = nowNs
                 }
-            }
-        } catch (_: InterruptedException) {
-            // Normal stop
-        } catch (t: Throwable) {
-            if (running.get()) {
-                stopInternal()
-                mainHandler.post {
-                    listener.onSyncError("خطأ أثناء قراءة الميكروفون: ${t.message ?: "غير معروف"}")
+                val normPeak = (peakAbs.toFloat() / 32768.0f).coerceIn(0f, 1f)
+                smoothedMicLevel = smoothedMicLevel * 0.65f + min(1f, normPeak * 2.5f) * 0.35f
+
+                // Feed 48 kHz mono mic chunk into H0 (downsamples internally to 8 kHz)
+                micFingerprinter.feed(micBuf, read, 1, MIC_SAMPLE_RATE, micChunkStartNs)
+
+                // Pull available 100 ms chunks from radio ring buffer (exact Lu0/h0.c lines 220-318)
+                val writeHead = radioSource.getCurrentWriteFrameIndex()
+                val oldestNow = radioSource.getOldestFrameIndex()
+                if (radioCursor < oldestNow) {
+                    radioCursor = oldestNow
                 }
-            }
-        } finally {
-            stopAudioRecordSafely()
-        }
-    }
-
-    private fun runDspSyncLoop(
-        radioQueue: ArrayBlockingQueue<PcmChunk>,
-        micQueue: ArrayBlockingQueue<PcmChunk>
-    ) {
-        val correlator = StreamingSlotCorrelator()
-        val gate = DoubleVerificationGate()
-
-        val radioFingerprinter = SpectralFingerprinter { centerTimeNs, vec ->
-            correlator.addRadioFrame(centerTimeNs, vec)
-        }
-        val micFingerprinter = SpectralFingerprinter { centerTimeNs, vec ->
-            correlator.addMicFrame(centerTimeNs, vec)
-        }
-
-        val sessionStartNs = System.nanoTime()
-
-        // 1. Pre-populate radio spectral ring from delay buffer history (100 ms chunks)
-        var lastHistoryEndNs = Long.MIN_VALUE
-        try {
-            radioSource.readHistoryChunks(
-                maxDurationMs = HISTORY_PRELOAD_MS,
-                chunkMs = HISTORY_CHUNK_MS
-            ) { pcm, frameCount, channels, sampleRate, startTimeNs ->
-                if (!running.get()) return@readHistoryChunks
-                radioFingerprinter.feed(pcm, frameCount, channels, sampleRate, startTimeNs)
-                val endNs = startTimeNs +
-                    (frameCount.toLong() * NANOS_PER_SEC) / sampleRate.toLong()
-                if (endNs > lastHistoryEndNs) {
-                    lastHistoryEndNs = endNs
+                val requiredShorts = radioChunkFrames * radioChannels
+                if (radioReadBuf.size != requiredShorts) {
+                    radioReadBuf = ShortArray(requiredShorts)
                 }
-            }
-        } catch (_: Throwable) {
-        }
 
-        var nextEvalNs = sessionStartNs + EVAL_INTERVAL_NS
-        var lastResult = CorrelationResult()
-
-        try {
-            while (running.get() && !Thread.currentThread().isInterrupted) {
-                var didWork = false
-
-                while (running.get()) {
-                    val rChunk = radioQueue.poll() ?: break
-                    val endNs = rChunk.startTimeNs +
-                        (rChunk.frameCount.toLong() * NANOS_PER_SEC) / rChunk.sampleRate.toLong()
-                    if (lastHistoryEndNs != Long.MIN_VALUE && endNs <= lastHistoryEndNs) {
-                        continue
-                    }
-                    lastHistoryEndNs = Long.MIN_VALUE
+                var chunksRead = 0
+                while (radioCursor + radioChunkFrames.toLong() <= writeHead &&
+                    chunksRead < MAX_RADIO_CHUNKS_PER_LOOP &&
+                    running.get()
+                ) {
+                    val copied = radioSource.readFramesAt(radioCursor, radioReadBuf, radioChunkFrames)
+                    if (copied <= 0) break
+                    val radioChunkStartNs = anchorWriteTimeNs +
+                        (radioCursor * NANOS_PER_SEC) / radioSampleRate.toLong()
                     radioFingerprinter.feed(
-                        rChunk.pcm,
-                        rChunk.frameCount,
-                        rChunk.channels,
-                        rChunk.sampleRate,
-                        rChunk.startTimeNs
+                        radioReadBuf,
+                        copied,
+                        radioChannels,
+                        radioSampleRate,
+                        radioChunkStartNs
                     )
-                    didWork = true
+                    radioCursor += copied.toLong()
+                    chunksRead++
                 }
 
-                while (running.get()) {
-                    val mChunk = micQueue.poll() ?: break
-                    micFingerprinter.feed(
-                        mChunk.pcm,
-                        mChunk.frameCount,
-                        mChunk.channels,
-                        mChunk.sampleRate,
-                        mChunk.startTimeNs
-                    )
-                    didWork = true
-                }
-
-                val nowNs = System.nanoTime()
-                val elapsedNs = nowNs - sessionStartNs
-
-                if (nowNs >= nextEvalNs) {
-                    nextEvalNs = nowNs + EVAL_INTERVAL_NS
+                // Evaluate once per second (exact Lu0/h0.c line 321)
+                if (nowNs - lastEvalNs >= EVAL_INTERVAL_NS) {
                     val evalResult = correlator.evaluate(
                         minLagMs = StreamingSlotCorrelator.MIN_LAG_MS,
                         maxLagMs = StreamingSlotCorrelator.MAX_LAG_MS
                     )
-                    lastResult = evalResult
 
                     when (val decision = gate.process(evalResult, correlator)) {
                         is DoubleVerificationGate.Decision.Confirmed -> {
-                            val lagSec = decision.confirmedLagMs / 1000.0
-                            stopInternal()
+                            val outputLatencyMs = max(0L, radioSource.getOutputLatencyNs() / 1_000_000L)
+                            val effectiveLagMs = outputLatencyMs.toDouble() + decision.confirmedLagMs
+                            running.set(false)
                             mainHandler.post {
                                 listener.onSyncConfirmed(
-                                    measuredLagSec = lagSec,
+                                    effectiveLagMs = effectiveLagMs,
                                     peakZ = decision.result.peakZ,
                                     overlapSec = decision.result.overlapSec
                                 )
@@ -983,7 +863,7 @@ class SyncEngine(
                         }
 
                         is DoubleVerificationGate.Decision.CandidateFirst -> {
-                            val candSec = decision.candidateLagMs / 1000.0
+                            val candSec = abs(decision.candidateLagMs) / 1000.0
                             val marginZ = decision.result.peakZ - decision.result.secondZ
                             mainHandler.post {
                                 listener.onCandidateDetected(
@@ -997,70 +877,83 @@ class SyncEngine(
                         is DoubleVerificationGate.Decision.None -> Unit
                     }
 
+                    val elapsedNs = nowNs - sessionStartNs
                     val elapsedSec = (elapsedNs / NANOS_PER_SEC).toInt().coerceAtLeast(0)
                     val hasCand = gate.confirmCount > 0 && !gate.candidateLagMs.isNaN()
-                    val candSec = if (hasCand) gate.candidateLagMs / 1000.0 else null
-                    val statusText = if (hasCand && candSec != null) {
-                        String.format(
-                            Locale.US,
-                            "تم رصد مرشّح %.1f ث • يتأكد على صوت جديد… (%d ث)",
-                            candSec,
-                            elapsedSec
-                        )
-                    } else if (latestMicRms < 0.03f && elapsedSec >= 3) {
-                        "صوت التلفزيون منخفض جداً • قرّب الهاتف من التلفزيون ($elapsedSec ث)"
-                    } else {
-                        "جاري الاستماع لصوت التلفزيون والمطابقة… ($elapsedSec ث)"
+                    val candSec = if (hasCand) abs(gate.candidateLagMs) / 1000.0 else null
+
+                    val statusText = when {
+                        nowNs - lastLoudTimeNs > SILENCE_WARN_NS ->
+                            "المايك ما يسمع التلفزيون • علّي صوت التلفزيون أو قرّب الموبايل"
+
+                        hasCand && candSec != null ->
+                            String.format(Locale.US, "مرشح %.1f ث • يتأكد…", candSec)
+
+                        else ->
+                            "يسمع التلفزيون… $elapsedSec ث"
                     }
 
                     mainHandler.post {
                         listener.onProgress(
                             elapsedSec = elapsedSec,
-                            micLevel = latestMicRms,
+                            micLevel = smoothedMicLevel,
                             hasCandidate = hasCand,
                             candidateLagSec = candSec,
-                            bestZ = if (lastResult.valid) lastResult.peakZ else 0.0,
-                            overlapSec = if (lastResult.valid) lastResult.overlapSec else 0.0,
+                            bestZ = if (evalResult.valid) evalResult.peakZ else 0.0,
+                            overlapSec = if (evalResult.valid) evalResult.overlapSec else 0.0,
                             statusText = statusText
                         )
                     }
-                }
 
-                if (!didWork) {
-                    val waited = micQueue.poll(15L, TimeUnit.MILLISECONDS)
-                    if (waited != null && running.get()) {
-                        micFingerprinter.feed(
-                            waited.pcm,
-                            waited.frameCount,
-                            waited.channels,
-                            waited.sampleRate,
-                            waited.startTimeNs
-                        )
+                    // Exact Lu0/h0.c lines 453-473: 60-second timeout (0xdf8475800L ns)
+                    if (elapsedNs > SYNC_TIMEOUT_NS) {
+                        throw SyncException("ما لكيت تطابق • تأكد أنها نفس المباراة وصوت الملعب مسموع من التلفزيون")
                     }
+
+                    lastEvalNs = nowNs
                 }
             }
         } catch (_: InterruptedException) {
             // Cancelled cleanly
+        } catch (e: SyncException) {
+            if (running.getAndSet(false)) {
+                val msg = e.message ?: "تعذر القياس"
+                mainHandler.post { listener.onSyncError(msg) }
+            }
         } catch (t: Throwable) {
-            if (running.get()) {
-                stopInternal()
-                mainHandler.post {
-                    listener.onSyncError("توقفت المزامنة بسبب خطأ داخلي: ${t.message ?: "غير معروف"}")
+            if (running.getAndSet(false)) {
+                val msg = "تعذر القياس: ${t.javaClass.simpleName}"
+                mainHandler.post { listener.onSyncError(msg) }
+            }
+        } finally {
+            stopAudioRecordSafely()
+            if (record != null) {
+                try {
+                    record.release()
+                } catch (_: Throwable) {
+                }
+            }
+            synchronized(sessionLock) {
+                if (workerThread == Thread.currentThread()) {
+                    workerThread = null
                 }
             }
         }
     }
 
+    private class SyncException(message: String) : Exception(message)
+
     companion object {
-        // Retained for compatibility with FootSyncPrefs
         const val DEFAULT_TIMEOUT_SEC = 60
-        private const val MIC_SAMPLE_RATE = 16_000
-        private const val MIC_READ_FRAMES = 640
-        private const val HISTORY_PRELOAD_MS = 125_000L
-        private const val HISTORY_CHUNK_MS = 100
+        private const val MIC_SAMPLE_RATE = 48_000
+        private const val MIC_READ_SAMPLES = 960
+        private const val MIN_RECORD_BUFFER_BYTES = 19_200
+        private const val HISTORY_LOOKBACK_SEC = 64.0
+        private const val LOUD_PEAK_THRESHOLD = 300
+        private const val MAX_RADIO_CHUNKS_PER_LOOP = 300
         private const val EVAL_INTERVAL_NS = 1_000_000_000L
+        private const val SILENCE_WARN_NS = 3_000_000_000L
+        private const val SYNC_TIMEOUT_NS = 60_000_000_000L
         private const val NANOS_PER_SEC = 1_000_000_000L
-        private const val RADIO_QUEUE_CAPACITY = 256
-        private const val MIC_QUEUE_CAPACITY = 128
     }
 }
