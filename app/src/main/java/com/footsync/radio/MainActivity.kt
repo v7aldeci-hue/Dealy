@@ -82,6 +82,7 @@ class MainActivity : AppCompatActivity() {
     private var latestState = ServiceUiState()
     private var selectedLibraryId: String = LibraryManager.MANUAL_LIBRARY_ID
     private var browsingLibraryId: String? = null
+    private var lastLibrariesRenderKey: String = ""
     private var userDraggingSeekBar = false
     private var pendingAutoSyncAfterPermission = false
     private var pendingOverlayAfterPermission = false
@@ -275,6 +276,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         uiHandler.removeCallbacks(syncElapsedTicker)
+        wasSyncingUi = false
         pulseRingView.pauseAnimation()
         playbackService?.removeStateListener(stateListener)
         super.onStop()
@@ -333,6 +335,9 @@ class MainActivity : AppCompatActivity() {
                 val barColor = if (pageIdx == PAGE_HOME) COLOR_HOME_BG else COLOR_DARK_SURFACE_BG
                 window.statusBarColor = barColor
                 window.navigationBarColor = barColor
+                if (pageIdx == PAGE_LIBRARIES) {
+                    refreshLibrariesPageUi()
+                }
                 if (pageIdx != PAGE_DELAY) {
                     hideKeyboard()
                 }
@@ -1957,4 +1962,1429 @@ class MainActivity : AppCompatActivity() {
             tvHomePrompt.text = "اضغط للمزامنة"
             tvHomeElapsedPill.visibility = View.GONE
             tvHomeSyncSubtext.text = if (state.isPlaying || state.isBuffering) {
-                String.format(Locale.US, "%s • %.1f
+                String.format(Locale.US, "%s • %.1f KB/s", state.connectionStatus, state.speedKbps)
+            } else {
+                ""
+            }
+            tvHomeSyncSubtext.visibility =
+                if (tvHomeSyncSubtext.text.isNotEmpty()) View.VISIBLE else View.INVISIBLE
+        }
+
+        if (!state.isSyncing && state.lastSyncBannerText.isNotBlank()) {
+            tvHomeBanner.text = state.lastSyncBannerText
+            tvHomeBanner.visibility = View.VISIBLE
+        } else {
+            tvHomeBanner.visibility = View.GONE
+        }
+
+        // Bottom quick buttons state
+        val activePlayback = state.isPlaying || state.isBuffering
+        icHomePlayPause.setIcon(if (activePlayback) IconType.PAUSE else IconType.PLAY, Color.WHITE)
+        lblHomePlayPause.text = if (activePlayback) "إيقاف" else "تشغيل"
+        btnHomePlayPause.background = rippleButtonDrawable(
+            fillColor = if (activePlayback) COLOR_ACCENT_BLUE else COLOR_HOME_CIRCLE_BTN,
+            strokeColor = if (activePlayback) COLOR_ACCENT_BLUE else Color.parseColor("#2E3540"),
+            radiusPx = dp(28).toFloat()
+        )
+
+        icHomeMute.setIcon(
+            if (state.isMuted) IconType.MUTE else IconType.UNMUTE,
+            if (state.isMuted) COLOR_WARNING else Color.WHITE
+        )
+        lblHomeMute.text = if (state.isMuted) "مكتوم" else "كتم"
+        btnHomeMute.background = rippleButtonDrawable(
+            fillColor = if (state.isMuted) COLOR_WARNING_SOFT else COLOR_HOME_CIRCLE_BTN,
+            strokeColor = if (state.isMuted) COLOR_WARNING else Color.parseColor("#2E3540"),
+            radiusPx = dp(24).toFloat()
+        )
+
+        icHomeOverlay.setIcon(
+            IconType.OVERLAY,
+            if (state.isOverlayVisible) COLOR_ACCENT_BLUE else Color.WHITE
+        )
+        btnHomeOverlay.background = rippleButtonDrawable(
+            fillColor = if (state.isOverlayVisible) Color.parseColor("#220A84FF") else COLOR_HOME_CIRCLE_BTN,
+            strokeColor = if (state.isOverlayVisible) COLOR_ACCENT_BLUE else Color.parseColor("#2E3540"),
+            radiusPx = dp(24).toFloat()
+        )
+
+        // --- Page 2 (Right Delay Controls) updates ---
+        if (!userDraggingSeekBar) {
+            tvDelayReadout.text = delayText
+            seekDelay.progress = (state.delaySec * 10.0).roundToInt().coerceIn(0, seekDelay.max)
+        }
+        tvDelayBufferInfo.text = String.format(
+            Locale.US,
+            "الذاكرة الصوتية: %d ث • السرعة: %.1f KB/s • %s",
+            state.bufferedHistorySec.toInt(),
+            state.speedKbps,
+            state.connectionStatus
+        )
+
+        // --- Page 3 (Left Libraries / Channels) highlight refresh only when active station changes ---
+        val libRenderKey = "${state.libraryId}|${state.channelIndex}|${state.channelUrl}|${state.totalChannels}"
+        if (libRenderKey != lastLibrariesRenderKey) {
+            lastLibrariesRenderKey = libRenderKey
+            refreshLibrariesPageUi()
+        }
+    }
+
+    private fun refreshLibrariesPageUi() {
+        val libs = libraryManager.getLibraries()
+        if (libs.none { it.id == selectedLibraryId }) {
+            selectedLibraryId = libs.first().id
+        }
+
+        val openLibId = browsingLibraryId
+        val openLib = if (openLibId != null) libs.firstOrNull { it.id == openLibId } else null
+
+        if (openLib == null) {
+            browsingLibraryId = null
+            tvLibrariesSubtitle.visibility = View.VISIBLE
+            librariesGridScroll.visibility = View.VISIBLE
+            channelBrowserContainer.visibility = View.GONE
+            renderLibrariesTwoColumnGrid(libs)
+        } else {
+            tvLibrariesSubtitle.visibility = View.GONE
+            librariesGridScroll.visibility = View.GONE
+            channelBrowserContainer.visibility = View.VISIBLE
+            renderInPageChannelGrid(openLib)
+        }
+    }
+
+    private fun renderLibrariesTwoColumnGrid(libs: List<RadioLibrary>) {
+        librariesGridContainer.removeAllViews()
+
+        val cards = ArrayList<View>(libs.size + 1)
+        cards.add(buildFeaturedAddLibraryCard())
+        for (lib in libs) {
+            cards.add(buildShazamLibraryCard(lib))
+        }
+
+        var i = 0
+        while (i < cards.size) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_LTR
+                layoutParams = matchWrap().apply {
+                    if (i > 0) topMargin = dp(12)
+                }
+            }
+
+            val leftCard = cards[i]
+            leftCard.layoutParams = LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                1f
+            ).apply {
+                marginEnd = dp(6)
+            }
+            row.addView(leftCard)
+
+            if (i + 1 < cards.size) {
+                val rightCard = cards[i + 1]
+                rightCard.layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    1f
+                ).apply {
+                    marginStart = dp(6)
+                }
+                row.addView(rightCard)
+            } else {
+                val emptySlot = View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, 1, 1f).apply {
+                        marginStart = dp(6)
+                    }
+                }
+                row.addView(emptySlot)
+            }
+
+            librariesGridContainer.addView(row)
+            i += 2
+        }
+        applyFontRecursively(librariesGridContainer)
+    }
+
+    private fun renderInPageChannelGrid(lib: RadioLibrary) {
+        tvChannelBrowserTitle.text = lib.name
+        tvChannelBrowserCount.text =
+            "${lib.channels.size} قناة بالترتيب التسلسلي • اضغط للتشغيل أو اضغط مطولاً للحذف"
+        btnChannelBrowserManage.visibility = if (lib.isManualDefault) View.GONE else View.VISIBLE
+
+        channelsGridContainer.removeAllViews()
+        if (lib.channels.isEmpty()) {
+            val emptyView = TextView(this).apply {
+                text = if (lib.isManualDefault) {
+                    "لا توجد روابط يدوية بعد.\nاضغط \"+ رابط يدوي\" لإضافة رابط بث مباشر."
+                } else {
+                    "هذه المكتبة فارغة."
+                }
+                setTextColor(COLOR_GRAY_SUBTITLE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                typeface = appTypeface
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(36), dp(16), dp(36))
+            }
+            channelsGridContainer.addView(emptyView)
+            return
+        }
+
+        val total = lib.channels.size
+        var i = 0
+        while (i < total) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                layoutParams = matchWrap().apply {
+                    if (i > 0) topMargin = dp(12)
+                }
+            }
+
+            val firstCard = buildShazamChannelCard(lib, i, lib.channels[i]).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f
+                ).apply {
+                    marginEnd = dp(6)
+                }
+            }
+            row.addView(firstCard)
+
+            if (i + 1 < total) {
+                val secondCard = buildShazamChannelCard(lib, i + 1, lib.channels[i + 1]).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                    ).apply {
+                        marginStart = dp(6)
+                    }
+                }
+                row.addView(secondCard)
+            } else {
+                val emptySlot = View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, 1, 1f).apply {
+                        marginStart = dp(6)
+                    }
+                }
+                row.addView(emptySlot)
+            }
+
+            channelsGridContainer.addView(row)
+            i += 2
+        }
+        applyFontRecursively(channelsGridContainer)
+    }
+
+    private fun adjustCalibration(deltaSec: Double) {
+        val updated = ((prefs.getCalibrationTrimSec() + deltaSec) * 20.0).roundToInt() / 20.0
+        prefs.setCalibrationTrimSec(updated.coerceIn(-2.0, 2.0))
+        refreshCalibrationReadout()
+    }
+
+    private fun refreshCalibrationReadout() {
+        val v = prefs.getCalibrationTrimSec()
+        tvCalibrationValue.text = if (abs(v) < 0.001) {
+            "0.00 ث"
+        } else {
+            String.format(Locale.US, "%+.2f ث", v)
+        }
+    }
+
+    // =========================================================================
+    // BUSINESS ACTIONS & DIALOGS
+    // =========================================================================
+
+    private fun applyDirectDelayInput() {
+        val raw = etDirectDelay.text.toString().trim()
+        if (raw.isEmpty()) {
+            toast("أدخل قيمة التأخير بالثواني أولاً.")
+            return
+        }
+        val normalized = normalizeNumericInput(raw)
+        val parsed = normalized.toDoubleOrNull()
+        if (parsed == null || parsed < 0.0) {
+            toast("أدخل رقماً صالحاً بين 0 و 180 ثانية.")
+            return
+        }
+        val clamped = parsed.coerceIn(0.0, FootSyncPrefs.MAX_DELAY_SEC)
+        playbackService?.setDelaySeconds(clamped, persistForUrl = true)
+        etDirectDelay.setText(String.format(Locale.US, "%.2f", clamped))
+        etDirectDelay.clearFocus()
+        hideKeyboard()
+        toast(String.format(Locale.US, "تم ضبط التأخير على %.2f ث", clamped))
+    }
+
+    private fun normalizeNumericInput(input: String): String {
+        val sb = StringBuilder(input.length)
+        for (ch in input) {
+            when (ch) {
+                '٠', '۰' -> sb.append('0')
+                '١', '۱' -> sb.append('1')
+                '٢', '۲' -> sb.append('2')
+                '٣', '۳' -> sb.append('3')
+                '٤', '۴' -> sb.append('4')
+                '٥', '۵' -> sb.append('5')
+                '٦', '۶' -> sb.append('6')
+                '٧', '۷' -> sb.append('7')
+                '٨', '۸' -> sb.append('8')
+                '٩', '۹' -> sb.append('9')
+                ',', '٫', '،' -> sb.append('.')
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun handleAutoSyncClick() {
+        val svc = playbackService
+        if (svc == null) {
+            toast("جاري تهيئة مشغّل الصوت…")
+            return
+        }
+        if (latestState.isSyncing) {
+            svc.cancelAutoSync()
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        svc.startAutoSync()
+    }
+
+    private fun handleTwoTapStopwatchClick() {
+        val svc = playbackService ?: return
+        if (!stopwatchActive) {
+            if (!latestState.isPlaying && !latestState.isBuffering) {
+                toast("شغّل قناة إذاعية أولاً قبل المزامنة اليدوية.")
+                return
+            }
+            stopwatchActive = true
+            stopwatchStartMs = SystemClock.elapsedRealtime()
+            mutedBeforeStopwatch = latestState.isMuted
+            svc.setMuted(true)
+            btnTwoTapSync.background = rippleButtonDrawable(
+                COLOR_WARNING_SOFT,
+                COLOR_WARNING,
+                dp(12).toFloat()
+            )
+            btnTwoTapSync.setTextColor(COLOR_WARNING)
+            uiHandler.post(stopwatchTicker)
+        } else {
+            stopwatchActive = false
+            uiHandler.removeCallbacks(stopwatchTicker)
+            val elapsedSec = (SystemClock.elapsedRealtime() - stopwatchStartMs).toDouble() / 1000.0
+            val newDelay = (latestState.delaySec + elapsedSec).coerceIn(0.0, FootSyncPrefs.MAX_DELAY_SEC)
+            svc.setDelaySeconds(newDelay, persistForUrl = true)
+            svc.setMuted(false)
+            tvStopwatchDisplay.text = "0.00 ث"
+            btnTwoTapSync.text = "مزامنة بضغطتين"
+            btnTwoTapSync.background = rippleButtonDrawable(
+                Color.parseColor("#2B2B2B"),
+                Color.parseColor("#3E3E3E"),
+                dp(12).toFloat()
+            )
+            btnTwoTapSync.setTextColor(Color.WHITE)
+            toast(String.format(Locale.US, "تمت إضافة %.2f ث • التأخير الآن %.2f ث", elapsedSec, newDelay))
+        }
+    }
+
+    private fun handleFloatingOverlayClick() {
+        val svc = playbackService ?: return
+        if (latestState.isOverlayVisible) {
+            svc.hideFloatingOverlay()
+            return
+        }
+        if (!Settings.canDrawOverlays(this)) {
+            pendingOverlayAfterPermission = true
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+            overlayPermissionLauncher.launch(intent)
+            return
+        }
+        launchOverlayAndBackground()
+    }
+
+    private fun launchOverlayAndBackground() {
+        ensureServiceStarted()
+        val shown = playbackService?.showFloatingOverlay(startMinimized = false) == true
+        if (shown) {
+            moveTaskToBack(true)
+        } else {
+            toast("تعذّر إظهار النافذة العائمة.")
+        }
+    }
+
+    private fun showStyledDialog(builder: AlertDialog.Builder) {
+        val dialog = builder.create()
+        dialog.setOnShowListener {
+            dialog.window?.decorView?.let { applyFontRecursively(it) }
+        }
+        dialog.show()
+    }
+
+    private fun showAddLibraryChooserDialog() {
+        val options = arrayOf(
+            "استيراد ملف من الهاتف (M3U / JSON / XML / TXT / CFG)",
+            "استيراد من رابط قائمة (URL)",
+            "لصق نص القائمة مباشرة",
+            "إضافة رابط بث مباشر يدوي"
+        )
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle("إضافة مكتبة صوتيات")
+                .setItems(options) { _, which ->
+                    when (which) {
+                        0 -> openDocumentLauncher.launch(arrayOf("*/*"))
+                        1 -> showImportUrlDialog()
+                        2 -> showImportRawTextDialog()
+                        3 -> showAddManualUrlDialog()
+                    }
+                }
+                .setNegativeButton("إلغاء", null)
+        )
+    }
+
+    private fun promptLibraryNameAndImportUri(uri: Uri) {
+        val defaultName = libraryManager.queryDisplayName(uri)
+        val input = makeDialogEditText("اسم المكتبة", defaultName)
+
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle("استيراد مكتبة من ملف")
+                .setView(wrapDialogView(input))
+                .setPositiveButton("استيراد") { _, _ ->
+                    val name = input.text.toString().trim().ifEmpty { defaultName }
+                    toast("جاري قراءة وتحليل الملف…")
+                    ioExecutor.execute {
+                        val res = libraryManager.importFromUri(uri, name)
+                        runOnUiThread { handleImportResult(res) }
+                    }
+                }
+                .setNegativeButton("إلغاء", null)
+        )
+    }
+
+    private fun showImportUrlDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+        }
+        val etName = makeDialogEditText("اسم المكتبة (اختياري)", "")
+        val etUrl = makeDialogEditText("رابط القائمة (http:// أو https://)", "").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        container.addView(etName)
+        container.addView(spaceVertical(8))
+        container.addView(etUrl)
+
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle("استيراد مكتبة من رابط")
+                .setView(container)
+                .setPositiveButton("تحميل واستيراد") { _, _ ->
+                    val url = etUrl.text.toString().trim()
+                    val name = etName.text.toString().trim().ifEmpty { null }
+                    if (url.isEmpty()) {
+                        toast("أدخل رابط القائمة أولاً.")
+                        return@setPositiveButton
+                    }
+                    toast("جاري تحميل القائمة…")
+                    ioExecutor.execute {
+                        val res = libraryManager.importFromUrl(url, name)
+                        runOnUiThread { handleImportResult(res) }
+                    }
+                }
+                .setNegativeButton("إلغاء", null)
+        )
+    }
+
+    private fun showImportRawTextDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+        }
+        val etName = makeDialogEditText("اسم المكتبة", "مكتبة جديدة")
+        val etText = makeDialogEditText("الصق محتوى M3U أو JSON أو XML أو روابط TXT هنا", "").apply {
+            minLines = 5
+            maxLines = 9
+            gravity = Gravity.TOP or Gravity.START
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        container.addView(etName)
+        container.addView(spaceVertical(8))
+        container.addView(etText)
+
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle("لصق نص القائمة")
+                .setView(container)
+                .setPositiveButton("حفظ المكتبة") { _, _ ->
+                    val name = etName.text.toString().trim().ifEmpty { "مكتبة ملصوقة" }
+                    val raw = etText.text.toString()
+                    ioExecutor.execute {
+                        val res = libraryManager.importFromRawText(name, raw)
+                        runOnUiThread { handleImportResult(res) }
+                    }
+                }
+                .setNegativeButton("إلغاء", null)
+        )
+    }
+
+    private fun showAddManualUrlDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+        }
+        val etName = makeDialogEditText("اسم المحطة (اختياري)", "")
+        val etUrl = makeDialogEditText("رابط البث المباشر (http:// / https://)", "").apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        container.addView(etName)
+        container.addView(spaceVertical(8))
+        container.addView(etUrl)
+
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle("إضافة رابط بث يدوي")
+                .setView(container)
+                .setPositiveButton("تشغيل وحفظ") { _, _ ->
+                    val url = etUrl.text.toString().trim()
+                    val name = etName.text.toString().trim().ifEmpty { null }
+                    if (!url.startsWith("http://", ignoreCase = true) &&
+                        !url.startsWith("https://", ignoreCase = true) &&
+                        !url.startsWith("rtsp://", ignoreCase = true) &&
+                        !url.startsWith("rtmp://", ignoreCase = true)
+                    ) {
+                        toast("أدخل رابط بث صالح يبدأ بـ http:// أو https://")
+                        return@setPositiveButton
+                    }
+                    val target = libraryManager.addManualChannel(url, name)
+                    selectedLibraryId = target.libraryId
+                    refreshLibrariesPageUi()
+                    ensureServiceStarted()
+                    playbackService?.playTarget(target)
+                }
+                .setNegativeButton("إلغاء", null)
+        )
+    }
+
+    private fun handleImportResult(res: ImportResult) {
+        if (res.success && res.library != null) {
+            selectedLibraryId = res.library.id
+            browsingLibraryId = res.library.id
+            refreshLibrariesPageUi()
+            toast("تم استيراد ${res.channelCount} قناة (${res.detectedFormat}) إلى \"${res.library.name}\"")
+        } else {
+            toast(res.errorMessage ?: "فشل استيراد المكتبة.")
+        }
+    }
+
+    private fun showManageLibraryDialog(libraryId: String) {
+        val lib = libraryManager.getLibraryById(libraryId) ?: return
+        if (lib.isManualDefault) return
+
+        val actions = arrayOf("إعادة تسمية المكتبة", "حذف المكتبة")
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle(lib.name)
+                .setItems(actions) { _, which ->
+                    when (which) {
+                        0 -> {
+                            val input = makeDialogEditText("الاسم الجديد", lib.name)
+                            showStyledDialog(
+                                AlertDialog.Builder(this)
+                                    .setTitle("إعادة تسمية المكتبة")
+                                    .setView(wrapDialogView(input))
+                                    .setPositiveButton("حفظ") { _, _ ->
+                                        if (libraryManager.renameLibrary(lib.id, input.text.toString())) {
+                                            refreshLibrariesPageUi()
+                                        }
+                                    }
+                                    .setNegativeButton("إلغاء", null)
+                            )
+                        }
+
+                        1 -> {
+                            showStyledDialog(
+                                AlertDialog.Builder(this)
+                                    .setTitle("حذف المكتبة")
+                                    .setMessage("هل تريد حذف مكتبة \"${lib.name}\" وجميع قنواتها (${lib.channels.size})؟")
+                                    .setPositiveButton("حذف") { _, _ ->
+                                        if (libraryManager.deleteLibrary(lib.id)) {
+                                            if (browsingLibraryId == lib.id) {
+                                                browsingLibraryId = null
+                                            }
+                                            selectedLibraryId = libraryManager.getActiveLibrary().id
+                                            refreshLibrariesPageUi()
+                                            toast("تم حذف المكتبة.")
+                                        }
+                                    }
+                                    .setNegativeButton("إلغاء", null)
+                            )
+                        }
+                    }
+                }
+                .setNegativeButton("إغلاق", null)
+        )
+    }
+
+    private fun confirmDeleteChannel(lib: RadioLibrary, index: Int, channel: RadioChannel) {
+        showStyledDialog(
+            AlertDialog.Builder(this)
+                .setTitle("حذف القناة")
+                .setMessage("حذف \"${channel.name}\" من مكتبة \"${lib.name}\"؟")
+                .setPositiveButton("حذف") { _, _ ->
+                    if (libraryManager.deleteChannel(lib.id, index)) {
+                        refreshLibrariesPageUi()
+                    }
+                }
+                .setNegativeButton("إلغاء", null)
+        )
+    }
+
+    private fun ensureServiceStarted() {
+        val intent = Intent(this, RadioPlaybackService::class.java)
+        try {
+            ContextCompat.startForegroundService(this, intent)
+        } catch (_: Throwable) {
+            try {
+                startService(intent)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    private fun hideKeyboard() {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        currentFocus?.let { imm.hideSoftInputFromWindow(it.windowToken, 0) }
+    }
+
+    // =========================================================================
+    // UI STYLING, FONT PROPAGATION & ANIMATION HELPERS
+    // =========================================================================
+
+    private fun applyFontRecursively(view: View) {
+        if (view is TextView) {
+            val isBold = view.typeface?.isBold == true
+            view.typeface = if (isBold) appTypefaceBold else appTypeface
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                applyFontRecursively(view.getChildAt(i))
+            }
+        }
+    }
+
+    private fun buildPaginationDots(activeIndex: Int): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            gravity = Gravity.CENTER
+            for (i in 0 until 3) {
+                val dot = View(this@MainActivity).apply {
+                    val size = dp(6)
+                    layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                        if (i > 0) marginStart = dp(7)
+                    }
+                    background = roundedDrawable(
+                        fillColor = if (i == activeIndex) Color.WHITE else Color.parseColor("#55FFFFFF"),
+                        strokeColor = Color.TRANSPARENT,
+                        strokeWidthPx = 0,
+                        radiusPx = dp(3).toFloat()
+                    )
+                }
+                addView(dot)
+            }
+        }
+    }
+
+    private fun makeSectionHeading(title: String): TextView {
+        return TextView(this).apply {
+            text = title
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            typeface = appTypefaceBold
+            layoutParams = matchWrap()
+        }
+    }
+
+    private fun makePage2Card(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(16), dp(14), dp(16), dp(16))
+            background = roundedDrawable(
+                fillColor = COLOR_PAGE2_CARD,
+                strokeColor = Color.parseColor("#2A2A2A"),
+                strokeWidthPx = dp(1),
+                radiusPx = dp(16).toFloat()
+            )
+            layoutParams = matchWrap()
+        }
+    }
+
+    private fun makeSubtleDivider(): View {
+        return View(this).apply {
+            setBackgroundColor(Color.parseColor("#2B2B2B"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(1)
+            ).apply {
+                topMargin = dp(14)
+                bottomMargin = dp(14)
+            }
+        }
+    }
+
+    private fun makePillButton(
+        text: String,
+        bgColor: Int,
+        textColor: Int,
+        strokeColor: Int = Color.TRANSPARENT,
+        heightDp: Int = 44,
+        textSizeSp: Float = 13.5f
+    ): TextView {
+        return TextView(this).apply {
+            this.text = text
+            setTextColor(textColor)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, textSizeSp)
+            typeface = appTypefaceBold
+            gravity = Gravity.CENTER
+            minHeight = dp(heightDp)
+            background = rippleButtonDrawable(bgColor, strokeColor, dp(12).toFloat())
+            applySpringTouch(this)
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun applySpringTouch(target: View) {
+        target.setOnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.animate()
+                        .scaleX(0.94f)
+                        .scaleY(0.94f)
+                        .setDuration(80L)
+                        .setInterpolator(LinearInterpolator())
+                        .start()
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.animate()
+                        .scaleX(1.0f)
+                        .scaleY(1.0f)
+                        .setDuration(170L)
+                        .setInterpolator(OvershootInterpolator(1.6f))
+                        .start()
+                }
+            }
+            false
+        }
+    }
+
+    private fun makeDialogEditText(hintText: String, initialValue: String): EditText {
+        return EditText(this).apply {
+            hint = hintText
+            setText(initialValue)
+            typeface = appTypeface
+            setSingleLine(true)
+            setSelection(text.length)
+        }
+    }
+
+    private fun wrapDialogView(view: View): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+            addView(view)
+        }
+    }
+
+    private fun roundedDrawable(
+        fillColor: Int,
+        strokeColor: Int,
+        strokeWidthPx: Int,
+        radiusPx: Float
+    ): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = radiusPx
+            setColor(fillColor)
+            if (strokeWidthPx > 0 && strokeColor != Color.TRANSPARENT) {
+                setStroke(strokeWidthPx, strokeColor)
+            }
+        }
+    }
+
+    private fun rippleButtonDrawable(
+        fillColor: Int,
+        strokeColor: Int,
+        radiusPx: Float
+    ): RippleDrawable {
+        val content = roundedDrawable(
+            fillColor = fillColor,
+            strokeColor = strokeColor,
+            strokeWidthPx = if (strokeColor != Color.TRANSPARENT) dp(1) else 0,
+            radiusPx = radiusPx
+        )
+        return RippleDrawable(
+            ColorStateList.valueOf(Color.parseColor("#33FFFFFF")),
+            content,
+            null
+        )
+    }
+
+    private fun matchWrap(): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+    }
+
+    private fun spaceVertical(dpVal: Int): View {
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dp(dpVal))
+        }
+    }
+
+    private fun spaceWeight(weight: Float): View {
+        return View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(1, 0, weight)
+        }
+    }
+
+    private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density + 0.5f).toInt()
+    }
+
+    private fun dp(value: Float): Int {
+        return (value * resources.displayMetrics.density + 0.5f).toInt()
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    // =========================================================================
+    // CUSTOM VIEWS: SQUARE COVER FRAME, SNAP PAGER, PULSE RINGS, VECTOR ICONS
+    // =========================================================================
+
+    private class SquareFrameLayout(context: Context) : FrameLayout(context) {
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            super.onMeasure(widthMeasureSpec, widthMeasureSpec)
+        }
+    }
+
+    private class SnapHorizontalPager(context: Context) : HorizontalScrollView(context) {
+
+        private val container = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            layoutParams = LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT)
+        }
+
+        private val pages = mutableListOf<View>()
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+        private var velocityTracker: VelocityTracker? = null
+        private var downX = 0f
+        private var downY = 0f
+        private var initialPositioned = false
+        private var pendingInitialPage = 1
+
+        var currentPage: Int = 1
+            private set
+
+        var onPageChanged: ((Int) -> Unit)? = null
+
+        init {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isFillViewport = true
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            addView(container)
+        }
+
+        fun setPages(pageViews: List<View>, initialPage: Int) {
+            container.removeAllViews()
+            pages.clear()
+            pages.addAll(pageViews)
+            pendingInitialPage = initialPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+            currentPage = pendingInitialPage
+            initialPositioned = false
+
+            val w = if (width > 0) width else resources.displayMetrics.widthPixels
+            for (p in pages) {
+                container.addView(p, LinearLayout.LayoutParams(w, LinearLayout.LayoutParams.MATCH_PARENT))
+            }
+            requestLayout()
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w > 0 && pages.isNotEmpty()) {
+                for (p in pages) {
+                    val lp = p.layoutParams
+                    if (lp.width != w) {
+                        lp.width = w
+                        p.layoutParams = lp
+                    }
+                }
+                val targetPage = if (!initialPositioned) pendingInitialPage else currentPage
+                initialPositioned = true
+                post {
+                    scrollTo(targetPage * w, 0)
+                    currentPage = targetPage
+                    onPageChanged?.invoke(currentPage)
+                }
+            }
+        }
+
+        fun scrollToPage(index: Int, animated: Boolean) {
+            if (pages.isEmpty()) return
+            val clamped = index.coerceIn(0, pages.lastIndex)
+            val pageW = if (width > 0) width else resources.displayMetrics.widthPixels
+            val targetX = clamped * pageW
+            if (animated) {
+                smoothScrollTo(targetX, 0)
+            } else {
+                scrollTo(targetX, 0)
+            }
+            if (currentPage != clamped) {
+                currentPage = clamped
+                onPageChanged?.invoke(currentPage)
+            }
+        }
+
+        override fun fling(velocityX: Int) {
+            // Suppress free-scrolling fling; snapping is performed cleanly on ACTION_UP
+        }
+
+        override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = ev.x
+                    downY = ev.y
+                    velocityTracker?.recycle()
+                    velocityTracker = VelocityTracker.obtain().apply { addMovement(ev) }
+                    return super.onInterceptTouchEvent(ev)
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = abs(ev.x - downX)
+                    val dy = abs(ev.y - downY)
+                    if (dy > touchSlop && dy >= dx) {
+                        return false
+                    }
+                    if (dx > touchSlop && dx > dy * 1.15f) {
+                        return super.onInterceptTouchEvent(ev)
+                    }
+                    return false
+                }
+            }
+            return super.onInterceptTouchEvent(ev)
+        }
+
+        @SuppressLint("ClickableViewAccessibility")
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            if (velocityTracker == null) {
+                velocityTracker = VelocityTracker.obtain()
+            }
+            velocityTracker?.addMovement(ev)
+
+            val handled = super.onTouchEvent(ev)
+
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                velocityTracker?.computeCurrentVelocity(1000)
+                val vx = velocityTracker?.xVelocity ?: 0f
+                velocityTracker?.recycle()
+                velocityTracker = null
+
+                val pageW = if (width > 0) width else resources.displayMetrics.widthPixels
+                val dragDelta = ev.x - downX
+                val targetPage = when {
+                    vx < -420f -> currentPage + 1
+                    vx > 420f -> currentPage - 1
+                    abs(dragDelta) > pageW * 0.24f -> {
+                        if (dragDelta < 0f) currentPage + 1 else currentPage - 1
+                    }
+
+                    else -> ((scrollX + pageW * 0.5f) / pageW.toFloat()).toInt()
+                }
+                scrollToPage(targetPage, animated = true)
+            }
+            return handled
+        }
+    }
+
+    private class PulseRingView(context: Context) : View(context) {
+
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
+        private var targetCircle: View? = null
+        private var isListening = false
+        private var micLevel = 0f
+        private var phase = 0f
+        private var lastGlowRadius = 0f
+        private var lastGlowListening = false
+
+        private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 3200L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener { anim ->
+                phase = anim.animatedValue as Float
+                updateCircleBreathingScale()
+                invalidate()
+            }
+        }
+
+        fun attachTargetCircle(view: View) {
+            targetCircle = view
+        }
+
+        fun setListening(listening: Boolean) {
+            if (isListening == listening) return
+            isListening = listening
+            val desiredDuration = if (listening) 1450L else 3200L
+            if (animator.duration != desiredDuration) {
+                animator.duration = desiredDuration
+            }
+            invalidate()
+        }
+
+        fun setMicLevel(level: Float) {
+            micLevel = level.coerceIn(0f, 1f)
+        }
+
+        fun resumeAnimation() {
+            if (!animator.isStarted) {
+                animator.start()
+            } else if (animator.isPaused) {
+                animator.resume()
+            }
+        }
+
+        fun pauseAnimation() {
+            if (animator.isRunning) {
+                animator.pause()
+            }
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            resumeAnimation()
+        }
+
+        override fun onDetachedFromWindow() {
+            animator.cancel()
+            super.onDetachedFromWindow()
+        }
+
+        private fun updateCircleBreathingScale() {
+            val target = targetCircle ?: return
+            if (target.isPressed) return
+            val wave = sin(phase * 2.0 * PI).toFloat()
+            val scale = if (isListening) {
+                1.015f + wave * (0.042f + micLevel * 0.028f)
+            } else {
+                1.008f + wave * 0.022f
+            }
+            target.scaleX = scale
+            target.scaleY = scale
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width * 0.5f
+            val cy = height * 0.5f
+            val maxR = min(cx, cy) * 0.98f
+            val baseR = maxR * 0.59f
+
+            if (lastGlowRadius != maxR || lastGlowListening != isListening) {
+                lastGlowRadius = maxR
+                lastGlowListening = isListening
+                val innerColor = if (isListening) {
+                    Color.parseColor("#660088FF")
+                } else {
+                    Color.parseColor("#1E3A5F99")
+                }
+                val midColor = if (isListening) {
+                    Color.parseColor("#240088FF")
+                } else {
+                    Color.parseColor("#0A1D2F4D")
+                }
+                glowPaint.shader = RadialGradient(
+                    cx,
+                    cy,
+                    maxR,
+                    intArrayOf(innerColor, midColor, Color.TRANSPARENT),
+                    floatArrayOf(0.45f, 0.78f, 1.0f),
+                    Shader.TileMode.CLAMP
+                )
+            }
+            canvas.drawCircle(cx, cy, maxR, glowPaint)
+
+            val ringCount = if (isListening) 3 else 2
+            val density = resources.displayMetrics.density
+            val baseStroke = (if (isListening) 2.6f else 1.5f) * density
+            val expandSpan = (maxR - baseR) * (if (isListening) (0.95f + micLevel * 0.12f) else 0.78f)
+
+            for (i in 0 until ringCount) {
+                val p = (phase + i.toFloat() / ringCount.toFloat()) % 1f
+                val eased = 1f - (1f - p) * (1f - p)
+                val radius = baseR + expandSpan * eased
+                val fade = (1f - p) * (1f - p)
+
+                if (isListening) {
+                    val alpha = (fade * (165f + micLevel * 65f)).roundToInt().coerceIn(0, 235)
+                    ringPaint.color = Color.argb(alpha, 0, 136, 255)
+                } else {
+                    val alpha = (fade * 52f).roundToInt().coerceIn(0, 60)
+                    ringPaint.color = Color.argb(alpha, 255, 255, 255)
+                }
+                ringPaint.strokeWidth = baseStroke * (1f - eased * 0.45f)
+                canvas.drawCircle(cx, cy, radius, ringPaint)
+            }
+        }
+    }
+
+    private enum class IconType {
+        LIBRARY,
+        DELAY,
+        HEADPHONES,
+        FINGERPRINT,
+        RADIO_WAVE,
+        PREV,
+        NEXT,
+        PLAY,
+        PAUSE,
+        MUTE,
+        UNMUTE,
+        OVERLAY,
+        GEAR,
+        MUSIC_NOTE,
+        BACK_LEFT,
+        FORWARD_RIGHT,
+        RESET,
+        PLUS,
+        MORE_VERT
+    }
+
+    private class VectorIconView(
+        context: Context,
+        private var iconType: IconType,
+        tintColor: Int
+    ) : View(context) {
+
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = tintColor
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = tintColor
+            style = Paint.Style.FILL
+        }
+
+        private val path = Path()
+        private val rect = RectF()
+
+        fun setIcon(type: IconType, tintColor: Int) {
+            iconType = type
+            strokePaint.color = tintColor
+            fillPaint.color = tintColor
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val s = min(w, h)
+            if (s <= 0f) return
+
+            val ox = (w - s) * 0.5f
+            val oy = (h - s) * 0.5f
+            canvas.save()
+            canvas.translate(ox, oy)
+            path.reset()
+
+            when (iconType) {
+                IconType.LIBRARY -> {
+                    canvas.drawCircle(s * 0.40f, s * 0.28f, s * 0.16f, fillPaint)
+                    rect.set(s * 0.12f, s * 0.52f, s * 0.68f, s * 0.96f)
+                    canvas.drawArc(rect, 180f, 180f, true, fillPaint)
+                    strokePaint.strokeWidth = s * 0.08f
+                    canvas.drawLine(s * 0.78f, s * 0.46f, s * 0.78f, s * 0.80f, strokePaint)
+                    canvas.drawLine(s * 0.78f, s * 0.46f, s * 0.92f, s * 0.52f, strokePaint)
+                    canvas.drawCircle(s * 0.72f, s * 0.82f, s * 0.09f, fillPaint)
+                }
+
+                IconType.DELAY -> {
+                    strokePaint.strokeWidth = s * 0.09f
+                    canvas.drawCircle(s * 0.50f, s * 0.50f, s * 0.38f, strokePaint)
+                    canvas.drawLine(s * 0.50f, s * 0.50f, s * 0.50f, s * 0.28f, strokePaint)
+                    canvas.drawLine(s * 0.50f, s * 0.50f, s * 0.69f, s * 0.60f, strokePaint)
+                }
+
+                IconType.HEADPHONES -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    rect.set(s * 0.16f, s * 0.16f, s * 0.84f, s * 0.84f)
+                    canvas.drawArc(rect, 180f, 180f, false, strokePaint)
+                    rect.set(s * 0.11f, s * 0.50f, s * 0.29f, s * 0.84f)
+                    canvas.drawRoundRect(rect, s * 0.08f, s * 0.08f, fillPaint)
+                    rect.set(s * 0.71f, s * 0.50f, s * 0.89f, s * 0.84f)
+                    canvas.drawRoundRect(rect, s * 0.08f, s * 0.08f, fillPaint)
+                }
+
+                IconType.FINGERPRINT -> {
+                    strokePaint.strokeWidth = s * 0.056f
+
+                    // 1. Outermost top crest arch
+                    rect.set(s * 0.12f, s * 0.08f, s * 0.88f, s * 0.84f)
+                    canvas.drawArc(rect, -135f, 90f, false, strokePaint)
+
+                    // 2. Second outer arch spanning upper shoulders
+                    rect.set(s * 0.07f, s * 0.18f, s * 0.93f, s * 1.04f)
+                    canvas.drawArc(rect, -152f, 124f, false, strokePaint)
+
+                    // 3. Third ridge: left curve + top arch + right curve hooking inward at bottom-right
+                    path.reset()
+                    path.moveTo(s * 0.16f, s * 0.76f)
+                    path.cubicTo(s * 0.10f, s * 0.55f, s * 0.14f, s * 0.30f, s * 0.50f, s * 0.30f)
+                    path.cubicTo(s * 0.80f, s * 0.30f, s * 0.89f, s * 0.50f, s * 0.85f, s * 0.65f)
+                    path.cubicTo(s * 0.82f, s * 0.76f, s * 0.66f, s * 0.78f, s * 0.61f, s * 0.65f)
+                    path.cubicTo(s * 0.58f, s * 0.56f, s * 0.56f, s * 0.50f, s * 0.50f, s * 0.50f)
+                    path.cubicTo(s * 0.40f, s * 0.50f, s * 0.36f, s * 0.61f, s * 0.40f, s * 0.74f)
+                    path.cubicTo(s * 0.44f, s * 0.84f, s * 0.53f, s * 0.90f, s * 0.64f, s * 0.93f)
+                    canvas.drawPath(path, strokePaint)
+
+                    // 4. Fourth ridge: inner-left arch curling cleanly down to bottom-left
+                    path.reset()
+                    path.moveTo(s * 0.39f, s * 0.91f)
+                    path.cubicTo(s * 0.25f, s * 0.78f, s * 0.22f, s * 0.56f, s * 0.31f, s * 0.45f)
+                    path.cubicTo(s * 0.41f, s * 0.36f, s * 0.63f, s * 0.37f, s * 0.71f, s * 0.51f)
+                    path.cubicTo(s * 0.74f, s * 0.57f, s * 0.74f, s * 0.62f, s * 0.73f, s * 0.66f)
+                    canvas.drawPath(path, strokePaint)
+
+                    // 5. Center core stem curving down and right toward bottom-right
+                    path.reset()
+                    path.moveTo(s * 0.50f, s * 0.61f)
+                    path.cubicTo(s * 0.50f, s * 0.75f, s * 0.60f, s * 0.85f, s * 0.78f, s * 0.84f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.RADIO_WAVE -> {
+                    canvas.drawCircle(s * 0.50f, s * 0.52f, s * 0.11f, fillPaint)
+                    strokePaint.strokeWidth = s * 0.08f
+                    rect.set(s * 0.28f, s * 0.30f, s * 0.72f, s * 0.74f)
+                    canvas.drawArc(rect, -50f, 100f, false, strokePaint)
+                    canvas.drawArc(rect, 130f, 100f, false, strokePaint)
+                    rect.set(s * 0.12f, s * 0.14f, s * 0.88f, s * 0.90f)
+                    canvas.drawArc(rect, -48f, 96f, false, strokePaint)
+                    canvas.drawArc(rect, 132f, 96f, false, strokePaint)
+                }
+
+                IconType.PREV -> {
+                    rect.set(s * 0.18f, s * 0.22f, s * 0.29f, s * 0.78f)
+                    canvas.drawRoundRect(rect, s * 0.04f, s * 0.04f, fillPaint)
+                    path.moveTo(s * 0.80f, s * 0.22f)
+                    path.lineTo(s * 0.34f, s * 0.50f)
+                    path.lineTo(s * 0.80f, s * 0.78f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+
+                IconType.NEXT -> {
+                    path.moveTo(s * 0.20f, s * 0.22f)
+                    path.lineTo(s * 0.66f, s * 0.50f)
+                    path.lineTo(s * 0.20f, s * 0.78f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    rect.set(s * 0.71f, s * 0.22f, s * 0.82f, s * 0.78f)
+                    canvas.drawRoundRect(rect, s * 0.04f, s * 0.04f, fillPaint)
+                }
+
+                IconType.PLAY -> {
+                    path.moveTo(s * 0.28f, s * 0.18f)
+                    path.lineTo(s * 0.82f, s * 0.50f)
+                    path.lineTo(s * 0.28f, s * 0.82f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                }
+
+                IconType.PAUSE -> {
+                    rect.set(s * 0.24f, s * 0.20f, s * 0.42f, s * 0.80f)
+                    canvas.drawRoundRect(rect, s * 0.06f, s * 0.06f, fillPaint)
+                    rect.set(s * 0.58f, s * 0.20f, s * 0.76f, s * 0.80f)
+                    canvas.drawRoundRect(rect, s * 0.06f, s * 0.06f, fillPaint)
+                }
+
+                IconType.UNMUTE -> {
+                    path.moveTo(s * 0.16f, s * 0.38f)
+                    path.lineTo(s * 0.34f, s * 0.38f)
+                    path.lineTo(s * 0.54f, s * 0.20f)
+                    path.lineTo(s * 0.54f, s * 0.80f)
+                    path.lineTo(s * 0.34f, s * 0.62f)
+                    path.lineTo(s * 0.16f, s * 0.62f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    strokePaint.strokeWidth = s * 0.08f
+                    rect.set(s * 0.50f, s * 0.32f, s * 0.74f, s * 0.68f)
+                    canvas.drawArc(rect, -55f, 110f, false, strokePaint)
+                    rect.set(s * 0.52f, s * 0.20f, s * 0.88f, s * 0.80f)
+                    canvas.drawArc(rect, -55f, 110f, false, strokePaint)
+                }
+
+                IconType.MUTE -> {
+                    path.moveTo(s * 0.14f, s * 0.38f)
+                    path.lineTo(s * 0.32f, s * 0.38f)
+                    path.lineTo(s * 0.52f, s * 0.20f)
+                    path.lineTo(s * 0.52f, s * 0.80f)
+                    path.lineTo(s * 0.32f, s * 0.62f)
+                    path.lineTo(s * 0.14f, s * 0.62f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    strokePaint.strokeWidth = s * 0.09f
+                    canvas.drawLine(s * 0.64f, s * 0.36f, s * 0.86f, s * 0.64f, strokePaint)
+                    canvas.drawLine(s * 0.86f, s * 0.36f, s * 0.64f, s * 0.64f, strokePaint)
+                }
+
+                IconType.OVERLAY -> {
+                    strokePaint.strokeWidth = s * 0.085f
+                    rect.set(s * 0.12f, s * 0.18f, s * 0.88f, s * 0.82f)
+                    canvas.drawRoundRect(rect, s * 0.10f, s * 0.10f, strokePaint)
+                    rect.set(s * 0.46f, s * 0.46f, s * 0.80f, s * 0.74f)
+                    canvas.drawRoundRect(rect, s * 0.06f, s * 0.06f, fillPaint)
+                }
+
+                IconType.GEAR -> {
+                    val cx = s * 0.50f
+                    val cy = s * 0.50f
+                    strokePaint.strokeWidth = s * 0.13f
+                    for (i in 0 until 8) {
+                        val angle = i * PI / 4.0
+                        val x1 = cx + (s * 0.27f * cos(angle)).toFloat()
+                        val y1 = cy + (s * 0.27f * sin(angle)).toFloat()
+                        val x2 = cx + (s * 0.40f * cos(angle)).toFloat()
+                        val y2 = cy + (s * 0.40f * sin(angle)).toFloat()
+                        canvas.drawLine(x1, y1, x2, y2, strokePaint)
+                    }
+                    strokePaint.strokeWidth = s * 0.14f
+                    canvas.drawCircle(cx, cy, s * 0.24f, strokePaint)
+                }
+
+                IconType.MUSIC_NOTE -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    canvas.drawLine(s * 0.36f, s * 0.72f, s * 0.36f, s * 0.22f, strokePaint)
+                    canvas.drawLine(s * 0.76f, s * 0.64f, s * 0.76f, s * 0.14f, strokePaint)
+                    path.moveTo(s * 0.32f, s * 0.20f)
+                    path.lineTo(s * 0.81f, s * 0.10f)
+                    path.lineTo(s * 0.81f, s * 0.26f)
+                    path.lineTo(s * 0.32f, s * 0.36f)
+                    path.close()
+                    canvas.drawPath(path, fillPaint)
+                    canvas.drawCircle(s * 0.26f, s * 0.76f, s * 0.13f, fillPaint)
+                    canvas.drawCircle(s * 0.66f, s * 0.68f, s * 0.13f, fillPaint)
+                }
+
+                IconType.BACK_LEFT -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    path.moveTo(s * 0.62f, s * 0.20f)
+                    path.lineTo(s * 0.32f, s * 0.50f)
+                    path.lineTo(s * 0.62f, s * 0.80f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.FORWARD_RIGHT -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    path.moveTo(s * 0.38f, s * 0.20f)
+                    path.lineTo(s * 0.68f, s * 0.50f)
+                    path.lineTo(s * 0.38f, s * 0.80f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.RESET -> {
+                    strokePaint.strokeWidth = s * 0.095f
+                    rect.set(s * 0.18f, s * 0.18f, s * 0.82f, s * 0.82f)
+                    canvas.drawArc(rect, -45f, 290f, false, strokePaint)
+                    path.moveTo(s * 0.22f, s * 0.18f)
+                    path.lineTo(s * 0.22f, s * 0.40f)
+                    path.lineTo(s * 0.44f, s * 0.40f)
+                    canvas.drawPath(path, strokePaint)
+                }
+
+                IconType.PLUS -> {
+                    strokePaint.strokeWidth = s * 0.10f
+                    canvas.drawLine(s * 0.50f, s * 0.20f, s * 0.50f, s * 0.80f, strokePaint)
+                    canvas.drawLine(s * 0.20f, s * 0.50f, s * 0.80f, s * 0.50f, strokePaint)
+                }
+
+                IconType.MORE_VERT -> {
+                    val r = s * 0.085f
+                    canvas.drawCircle(s * 0.50f, s * 0.24f, r, fillPaint)
+                    canvas.drawCircle(s * 0.50f, s * 0.50f, r, fillPaint)
+                    canvas.drawCircle(s * 0.50f, s * 0.76f, r, fillPaint)
+                }
+            }
+            canvas.restore()
+        }
+    }
+
+    companion object {
+        private const val APP_FONT_ASSET_PATH = "fonts/app_font.ttf"
+
+        private const val PAGE_LIBRARIES = 0
+        private const val PAGE_HOME = 1
+        private const val PAGE_DELAY = 2
+
+        private val COLOR_HOME_BG = Color.parseColor("#0A0D12")
+        private val COLOR_HERO_IDLE = Color.parseColor("#3A3F47")
+        private val COLOR_SHAZAM_BLUE = Color.parseColor("#0088FF")
+        private val COLOR_HOME_CIRCLE_BTN = Color.parseColor("#232830")
+
+        private val COLOR_DARK_SURFACE_BG = Color.parseColor("#121212")
+        private val COLOR_PAGE2_CARD = Color.parseColor("#1E1E1E")
+        private val COLOR_LIB_CARD_BG = Color.parseColor("#1A1A1A")
+        private val COLOR_LIB_COVER_BG = Color.parseColor("#2C2C2C")
+
+        private val COLOR_ACCENT_BLUE = Color.parseColor("#0A84FF")
+        private val COLOR_ACCENT_GREEN = Color.parseColor("#22C55E")
+        private val COLOR_WARNING = Color.parseColor("#FBBF24")
+        private val COLOR_WARNING_SOFT = Color.parseColor("#2EFBBF24")
+
+        private val COLOR_TEXT_PRIMARY = Color.parseColor("#FFFFFF")
+        private val COLOR_TEXT_SECONDARY = Color.parseColor("#9CA3AF")
+        private val COLOR_GRAY_SUBTITLE = Color.parseColor("#9E9E9E")
+        private val COLOR_TEXT_MUTED = Color.parseColor("#6B7280")
+    }
+}
