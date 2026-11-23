@@ -39,7 +39,7 @@ interface RadioPcmSource {
 }
 
 /**
- * Callbacks emitted on the main thread during an unlimited auto-sync session.
+ * Callbacks emitted on the main thread during a continuous (no-timeout) auto-sync session.
  */
 interface SyncListener {
     fun onSyncStarted()
@@ -71,7 +71,7 @@ data class CorrelationResult(
 )
 
 /**
- * 40-band spectral-change fingerprinter adapted to 16 kHz mono:
+ * 40-band spectral-change fingerprinter translated from H0 and adapted to 16 kHz mono:
  * - Box-average downsampling to 16 kHz mono
  * - 512-point Hann-windowed radix-2 FFT, hop = 320 samples (20 ms / 50 Hz)
  * - 40 contiguous bands (3 bins/band starting at bin 4 -> ~125 Hz to 3875 Hz)
@@ -289,9 +289,9 @@ internal class SpectralFingerprinter(
         private const val FFT_MASK = FFT_SIZE - 1
         private const val HALF_FFT = FFT_SIZE / 2
         const val TARGET_SAMPLE_RATE = 16_000L
-        const val HOP_SAMPLES = 320 // 20 ms at 16 kHz
+        const val HOP_SAMPLES = 320
         const val NUM_BANDS = 40
-        private const val START_BIN = 4 // ~125 Hz to 3875 Hz
+        private const val START_BIN = 4
         private const val BINS_PER_BAND = 3
         private const val HISTORY_FRAMES = 4
         private const val NANOS_PER_SEC = 1_000_000_000L
@@ -325,7 +325,7 @@ internal class SpectralFingerprinter(
 }
 
 /**
- * Streaming slot correlator configured for lags from -30s to +120s
+ * Streaming slot correlator translated from G0 and configured for lags from -30s to +120s
  * with a ±1.0s (50-hop) secondary peak exclusion zone.
  */
 internal class StreamingSlotCorrelator {
@@ -568,26 +568,23 @@ internal class StreamingSlotCorrelator {
 
         const val MIN_LAG_MS = -30_000
         const val MAX_LAG_MS = 120_000
-        private const val MIN_LAG_HOPS = MIN_LAG_MS / HOP_MS // -1500
-        private const val MAX_LAG_HOPS = MAX_LAG_MS / HOP_MS // +6000
-        private const val LAG_COUNT = MAX_LAG_HOPS - MIN_LAG_HOPS + 1 // 7501
+        private const val MIN_LAG_HOPS = MIN_LAG_MS / HOP_MS
+        private const val MAX_LAG_HOPS = MAX_LAG_MS / HOP_MS
+        private const val LAG_COUNT = MAX_LAG_HOPS - MIN_LAG_HOPS + 1
 
         private const val RING_SIZE = 16384
         private const val RING_MASK = RING_SIZE - 1
 
-        private const val MIN_COUNT_HOPS = 100 // 2.0 s minimum overlap per lag
+        private const val MIN_COUNT_HOPS = 100
         private const val MIN_VALID_LAGS = 200
-        private const val EXCLUSION_HOPS = 50 // ±1.0 s exclusion zone
+        private const val EXCLUSION_HOPS = 50
         private const val MAD_SCALE = 1.4826
         private const val MAD_EPS = 1e-9
     }
 }
 
 /**
- * Double-verification anti-guessing gate tuned for smartphone microphones:
- * - Requires overlap >= 4.0 s, peakZ >= 5.5, and peakZ - secondZ >= 1.8
- * - Clears correlator accumulators immediately on Candidate #1
- * - Confirms when Candidate #2 falls within ±150 ms of Candidate #1 (averaging both lags)
+ * Double-verification anti-guessing gate translated from I0 and tuned for smartphone microphones.
  */
 internal class DoubleVerificationGate {
     sealed class Decision {
@@ -642,7 +639,7 @@ internal class DoubleVerificationGate {
 
 /**
  * On-demand 40-band spectral auto-sync engine for smartphone microphones.
- * Runs continuously with NO time limit until double-verification confirms a match or [cancel] is called.
+ * Runs continuously with NO timeout limit until double-verified or cancelled manually.
  */
 class SyncEngine(
     private val radioSource: RadioPcmSource,
@@ -921,7 +918,6 @@ class SyncEngine(
                 }
             }
         } catch (_: Throwable) {
-            // Continue with live stream even if history buffer was empty
         }
 
         var nextEvalNs = sessionStartNs + EVAL_INTERVAL_NS
@@ -1007,13 +1003,14 @@ class SyncEngine(
                     val statusText = if (hasCand && candSec != null) {
                         String.format(
                             Locale.US,
-                            "تم رصد مرشّح %.1f ث • يتأكد على صوت جديد…",
-                            candSec
+                            "تم رصد مرشّح %.1f ث • يتأكد على صوت جديد… (%d ث)",
+                            candSec,
+                            elapsedSec
                         )
                     } else if (latestMicRms < 0.03f && elapsedSec >= 3) {
-                        "صوت التلفزيون منخفض جداً • قرّب الهاتف من التلفزيون"
+                        "صوت التلفزيون منخفض جداً • قرّب الهاتف من التلفزيون ($elapsedSec ث)"
                     } else {
-                        "جاري الاستماع لصوت التلفزيون والمطابقة…"
+                        "جاري الاستماع لصوت التلفزيون والمطابقة… ($elapsedSec ث)"
                     }
 
                     mainHandler.post {
@@ -1055,10 +1052,10 @@ class SyncEngine(
     }
 
     companion object {
-        // Retained for backward compatibility with FootSyncPrefs in LibraryManager.kt
+        // Retained for compatibility with FootSyncPrefs
         const val DEFAULT_TIMEOUT_SEC = 60
         private const val MIC_SAMPLE_RATE = 16_000
-        private const val MIC_READ_FRAMES = 640 // 40 ms chunks at 16 kHz
+        private const val MIC_READ_FRAMES = 640
         private const val HISTORY_PRELOAD_MS = 125_000L
         private const val HISTORY_CHUNK_MS = 100
         private const val EVAL_INTERVAL_NS = 1_000_000_000L
