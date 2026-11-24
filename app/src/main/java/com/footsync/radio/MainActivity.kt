@@ -262,6 +262,7 @@ class MainActivity : AppCompatActivity() {
 
         val svcIntent = Intent(this, RadioPlaybackService::class.java)
         bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+        AppVersionGate.check(this)
     }
 
     override fun onStart() {
@@ -272,6 +273,11 @@ class MainActivity : AppCompatActivity() {
         }
         playbackService?.addStateListener(stateListener)
         pulseRingView.resumeAnimation()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AppVersionGate.check(this)
     }
 
     override fun onStop() {
