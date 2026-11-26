@@ -136,6 +136,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     private var requestedDelayMs = 0L
     @Volatile
     private var outputMuted = false
+    private var exoStreamDriftFrames = 0L
+    private var pendingDriftResetFrames = 0L
     private var activeDelayFrames = 0L
     private var previousDelayFrames = 0L
     private var crossfadeRemaining = 0
@@ -181,21 +183,58 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         lastWriteEndNs = Long.MIN_VALUE
         preserveBufferOnNextResetAndConfigure = false
         pendingGapFillAfterReconnect = false
+        exoStreamDriftFrames = 0L
+        pendingDriftResetFrames = 0L
         crossfadeRemaining = 0
         resumeFadeRemaining = 0
-        activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
+        activeDelayFrames = effectiveDelayFramesLocked()
         previousDelayFrames = activeDelayFrames
+    }
+
+    /**
+     * Tier-1 zero-interruption drift compensation:
+     * When the user has an active delay (e.g. 10s-20s) and a stall occurs, absorbs the exact
+     * stall duration by shifting the ring-buffer read pointer forward with a smooth crossfade.
+     * Keeps TV sync exact without reconnecting or dropping a single word of audio.
+     * Returns the absorbed duration in ms (either full [stallMs] or 0L if headroom is insufficient).
+     */
+    fun tryAbsorbExoStreamDriftMs(stallMs: Long): Long = synchronized(ringLock) {
+        if (ringBuffer.isEmpty() || totalFramesWritten <= 0L || sampleRate <= 0 || stallMs <= 0L) {
+            return@synchronized 0L
+        }
+        val requestedFrames = delayMsToFramesLocked(requestedDelayMs)
+        val headroomFrames = (requestedFrames - exoStreamDriftFrames).coerceAtLeast(0L)
+        if (headroomFrames <= 0L) return@synchronized 0L
+
+        val stallFrames = (stallMs * sampleRate.toLong()) / 1_000L
+        if (stallFrames <= 0L || stallFrames > headroomFrames) {
+            return@synchronized 0L
+        }
+
+        exoStreamDriftFrames += stallFrames
+        return@synchronized stallMs
+    }
+
+    /**
+     * Resets Tier-1 stream-drift compensation when establishing a fresh sync baseline
+     * (after Auto-Sync confirmation, delay reset, or disabling Live Edge Recovery).
+     */
+    fun resetStreamDriftCompensation() = synchronized(ringLock) {
+        exoStreamDriftFrames = 0L
+        pendingDriftResetFrames = 0L
     }
 
     /**
      * Preserves the existing PCM delay ring buffer across a same-channel live-edge reconnect
      * so delayed playback resumes immediately in sync with TV instead of waiting in silence
-     * for the buffer to refill.
+     * for the buffer to refill. Any prior Tier-1 absorbed drift is folded into the reconnect gap.
      */
     fun prepareForSameChannelLiveReconnect(bumpGeneration: Boolean = false) = synchronized(ringLock) {
         if (ringBuffer.isNotEmpty() && totalFramesWritten > 0L && lastWriteEndNs != Long.MIN_VALUE) {
             preserveBufferOnNextResetAndConfigure = true
             pendingGapFillAfterReconnect = true
+            pendingDriftResetFrames += exoStreamDriftFrames
+            exoStreamDriftFrames = 0L
             if (bumpGeneration) {
                 streamGeneration++
             }
@@ -205,11 +244,13 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
 
     /**
      * Marks an in-place live-edge jump (e.g., HLS seekToDefaultPosition) so the next PCM chunk
-     * advances the ring buffer by the exact elapsed wall-clock outage gap.
+     * advances the ring buffer by the exact elapsed wall-clock outage gap plus any prior drift.
      */
     fun markLiveEdgeJump(bumpGeneration: Boolean = false) = synchronized(ringLock) {
         if (ringBuffer.isNotEmpty() && totalFramesWritten > 0L && lastWriteEndNs != Long.MIN_VALUE) {
             pendingGapFillAfterReconnect = true
+            pendingDriftResetFrames += exoStreamDriftFrames
+            exoStreamDriftFrames = 0L
             if (bumpGeneration) {
                 streamGeneration++
             }
@@ -223,6 +264,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     fun releaseResources() = synchronized(ringLock) {
         preserveBufferOnNextResetAndConfigure = false
         pendingGapFillAfterReconnect = false
+        exoStreamDriftFrames = 0L
+        pendingDriftResetFrames = 0L
         lastWriteEndNs = Long.MIN_VALUE
         resumeFadeRemaining = 0
     }
@@ -249,7 +292,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
             preserveBufferOnNextResetAndConfigure = false
 
             if (sameFormatWithHistory) {
-                activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
+                activeDelayFrames = effectiveDelayFramesLocked()
                 previousDelayFrames = activeDelayFrames
                 crossfadeRemaining = 0
                 crossfadeTotal = (sampleRate / 100).coerceIn(64, 1024)
@@ -270,7 +313,9 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                 anchorWriteTimeNs = Long.MIN_VALUE
                 lastWriteEndNs = Long.MIN_VALUE
                 pendingGapFillAfterReconnect = false
-                activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
+                exoStreamDriftFrames = 0L
+                pendingDriftResetFrames = 0L
+                activeDelayFrames = effectiveDelayFramesLocked()
                 previousDelayFrames = activeDelayFrames
                 crossfadeRemaining = 0
                 resumeFadeRemaining = 0
@@ -325,18 +370,24 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
 
             if (pendingGapFillAfterReconnect) {
                 pendingGapFillAfterReconnect = false
+                val driftResetFrames = pendingDriftResetFrames
+                pendingDriftResetFrames = 0L
                 if (lastWriteEndNs != Long.MIN_VALUE && totalFramesWritten > 0L && sampleRate > 0) {
                     val gapNs = measuredWriteStartNs - lastWriteEndNs
-                    if (gapNs > MIN_GAP_FILL_NS) {
-                        val gapMs = gapNs / 1_000_000L
-                        val gapFrames = (gapMs * sampleRate.toLong()) / 1_000L
-                        if (gapFrames >= cap) {
-                            ringBuffer.fill(0.toShort())
-                            totalFramesWritten += gapFrames
-                            anchorWriteTimeNs = Long.MIN_VALUE
-                        } else if (gapFrames > 0L) {
-                            fillSilenceGapLocked(gapFrames)
-                        }
+                    val wallGapFrames = if (gapNs > MIN_GAP_FILL_NS) {
+                        ((gapNs / 1_000_000L) * sampleRate.toLong()) / 1_000L
+                    } else {
+                        0L
+                    }
+                    val totalGapFrames = wallGapFrames + driftResetFrames
+                    if (totalGapFrames >= cap) {
+                        ringBuffer.fill(0.toShort())
+                        totalFramesWritten = 0L
+                        anchorWriteTimeNs = Long.MIN_VALUE
+                        resumeFadeTotal = (sampleRate / 50).coerceIn(128, 1024)
+                        resumeFadeRemaining = resumeFadeTotal
+                    } else if (totalGapFrames > 0L) {
+                        fillSilenceGapLocked(totalGapFrames)
                         resumeFadeTotal = (sampleRate / 50).coerceIn(128, 1024)
                         resumeFadeRemaining = resumeFadeTotal
                     }
@@ -357,8 +408,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                 }
             }
 
-            val delayMs = requestedDelayMs
-            val targetDelayFrames = delayMsToFramesLocked(delayMs)
+            val targetDelayFrames = effectiveDelayFramesLocked()
             if (targetDelayFrames != activeDelayFrames) {
                 previousDelayFrames = activeDelayFrames
                 activeDelayFrames = targetDelayFrames
@@ -366,7 +416,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                 crossfadeRemaining = crossfadeTotal
             }
 
-            if (delayMs == 0L && activeDelayFrames == 0L && crossfadeRemaining == 0) {
+            if (targetDelayFrames == 0L && activeDelayFrames == 0L && crossfadeRemaining == 0) {
                 for (f in 0 until frameCount) {
                     val writeSlot = (totalFramesWritten % cap).toInt()
                     val writeBase = writeSlot * channelCount
@@ -462,6 +512,11 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         return ringBuffer[slot * channelCount + channel]
     }
 
+    private fun effectiveDelayFramesLocked(): Long {
+        val requestedFrames = delayMsToFramesLocked(requestedDelayMs)
+        return (requestedFrames - exoStreamDriftFrames).coerceAtLeast(0L)
+    }
+
     private fun delayMsToFramesLocked(delayMs: Long): Long {
         if (delayMs <= 0L) return 0L
         val rawFrames = (delayMs * sampleRate.toLong()) / 1000L
@@ -528,6 +583,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
             lastWriteEndNs = Long.MIN_VALUE
             preserveBufferOnNextResetAndConfigure = false
             pendingGapFillAfterReconnect = false
+            exoStreamDriftFrames = 0L
+            pendingDriftResetFrames = 0L
             resumeFadeRemaining = 0
             ringBuffer = ShortArray(0)
             scratchIn = ShortArray(0)
@@ -974,6 +1031,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     private var bufferingSinceMs = 0L
     private var pausedSinceMs = 0L
     private var lastLiveEdgeRecoveryMs = 0L
+    private var unrecoveredDriftMs = 0L
     private var consecutiveStallRecoveries = 0
     private var consecutiveZeroByteTicks = 0
     private var networkLostWhilePlaying = false
@@ -1054,23 +1112,38 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                 shouldStayAlive &&
                 !userStopped &&
                 !syncEngine.isRunning &&
-                hasReachedReadyForCurrentTarget &&
-                bufferingSinceMs > 0L
+                hasReachedReadyForCurrentTarget
             ) {
-                val stalledForMs = nowMs - bufferingSinceMs
-                val adaptiveWatchdogMs = when {
-                    consecutiveStallRecoveries >= 3 -> PROLONGED_STALL_WATCHDOG_MS * 2L + 1_000L
-                    consecutiveStallRecoveries == 2 -> PROLONGED_STALL_WATCHDOG_MS + 3_000L
-                    else -> PROLONGED_STALL_WATCHDOG_MS
+                val adaptiveCooldownMs = if (consecutiveStallRecoveries >= 3) {
+                    EXTENDED_RECOVERY_COOLDOWN_MS
+                } else {
+                    MIN_RECOVERY_COOLDOWN_MS
                 }
-                val cooldownPassed = (nowMs - lastLiveEdgeRecoveryMs) >= MIN_RECOVERY_COOLDOWN_MS
-                val zombieSocketStalled = consecutiveZeroByteTicks >= ZOMBIE_SOCKET_ZERO_BYTE_TICKS &&
-                    stalledForMs >= ZOMBIE_SOCKET_MIN_STALL_MS
+                val cooldownPassed = (nowMs - lastLiveEdgeRecoveryMs) >= adaptiveCooldownMs
 
-                if (cooldownPassed && (stalledForMs >= adaptiveWatchdogMs || zombieSocketStalled)) {
+                if (bufferingSinceMs > 0L) {
+                    val stalledForMs = nowMs - bufferingSinceMs
+                    val adaptiveWatchdogMs = when {
+                        consecutiveStallRecoveries >= 3 -> PROLONGED_STALL_WATCHDOG_MS * 2L + 1_000L
+                        consecutiveStallRecoveries == 2 -> PROLONGED_STALL_WATCHDOG_MS + 2_500L
+                        else -> PROLONGED_STALL_WATCHDOG_MS
+                    }
+                    val zombieSocketStalled = consecutiveZeroByteTicks >= ZOMBIE_SOCKET_ZERO_BYTE_TICKS &&
+                        stalledForMs >= ZOMBIE_SOCKET_MIN_STALL_MS
+
+                    if (cooldownPassed && (stalledForMs >= adaptiveWatchdogMs || zombieSocketStalled)) {
+                        unrecoveredDriftMs = 0L
+                        consecutiveStallRecoveries++
+                        performLiveEdgeRecovery(
+                            reasonLabel = "تجاوز التقطيع • القفز للبث المباشر…",
+                            forceHardReconnect = true
+                        )
+                    }
+                } else if (cooldownPassed && unrecoveredDriftMs >= LIVE_RECONNECT_DRIFT_THRESHOLD_MS) {
+                    unrecoveredDriftMs = 0L
                     consecutiveStallRecoveries++
                     performLiveEdgeRecovery(
-                        reasonLabel = "تجاوز التقطيع • القفز للبث المباشر…",
+                        reasonLabel = "تصحيح التأخير • القفز للبث المباشر…",
                         forceHardReconnect = true
                     )
                 }
@@ -1207,6 +1280,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         ignoreNextReadyStallRecovery = true
         bufferingSinceMs = SystemClock.elapsedRealtime()
         pausedSinceMs = 0L
+        unrecoveredDriftMs = 0L
         consecutiveStallRecoveries = 0
         consecutiveZeroByteTicks = 0
         networkLostWhilePlaying = false
@@ -1257,7 +1331,16 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             bufferingSinceMs = 0L
             pausedSinceMs = SystemClock.elapsedRealtime()
             mainHandler.removeCallbacks(reconnectRunnable)
-            p.playWhenReady = false
+            if (liveEdgeRecoveryEnabled) {
+                // Close old socket & flush stale ExoPlayer/HLS buffers immediately while preserving delay history
+                delayProcessor.prepareForSameChannelLiveReconnect(bumpGeneration = false)
+                streamRelay.stop()
+                p.playWhenReady = false
+                p.stop()
+                p.clearMediaItems()
+            } else {
+                p.playWhenReady = false
+            }
             releaseLocks()
             updateState {
                 it.copy(
@@ -1271,21 +1354,17 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         } else {
             userStopped = false
             shouldStayAlive = true
-            val pausedDurationMs = if (pausedSinceMs > 0L) {
-                SystemClock.elapsedRealtime() - pausedSinceMs
-            } else {
-                0L
-            }
             pausedSinceMs = 0L
             ensureForegroundStarted()
             acquireLocks()
-            if (p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) {
-                startStreamForTarget(target, isReconnect = liveEdgeRecoveryEnabled)
-            } else if (liveEdgeRecoveryEnabled && pausedDurationMs >= SIGNIFICANT_STALL_MS) {
+            if (liveEdgeRecoveryEnabled) {
+                // Always open a fresh live-edge connection on resume (works for both HLS .m3u8 and Icecast/MP3/AAC)
                 performLiveEdgeRecovery(
                     reasonLabel = "القفز للبث المباشر…",
-                    forceHardReconnect = !(p.isCurrentMediaItemLive || p.isCurrentMediaItemDynamic)
+                    forceHardReconnect = true
                 )
+            } else if (p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) {
+                startStreamForTarget(target, isReconnect = false)
             } else {
                 p.playWhenReady = true
                 updateState {
@@ -1328,6 +1407,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     }
 
     fun resetDelay() {
+        delayProcessor.resetStreamDriftCompensation()
         setDelaySeconds(0.0, persistForUrl = true)
     }
 
@@ -1335,6 +1415,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         liveEdgeRecoveryEnabled = enabled
         saveLiveEdgeRecoveryPref(enabled)
         if (!enabled) {
+            delayProcessor.resetStreamDriftCompensation()
+            unrecoveredDriftMs = 0L
             consecutiveStallRecoveries = 0
             networkLostWhilePlaying = false
         }
@@ -1603,6 +1685,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                     appliedDelaySec
                 )
             }
+            delayProcessor.resetStreamDriftCompensation()
+            unrecoveredDriftMs = 0L
             setDelaySeconds(appliedDelaySec, persistForUrl = true)
         } else {
             val lateSec = combinedMs / 1000.0
@@ -1613,6 +1697,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                 lateSec,
                 suggestedReceiverDelaySec
             )
+            delayProcessor.resetStreamDriftCompensation()
+            unrecoveredDriftMs = 0L
             setDelaySeconds(0.0, persistForUrl = true)
         }
 
@@ -1660,6 +1746,13 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(8_000)
             .setReadTimeoutMs(8_000)
+            .setDefaultRequestProperties(
+                mapOf(
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache",
+                    "Connection" to "close"
+                )
+            )
             .setTransferListener(directTransferListener)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(this)
@@ -1667,10 +1760,10 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                4_000,
-                10_000,
-                1_200,
-                1_500
+                3_500,
+                8_000,
+                900,
+                1_200
             )
             .build()
 
@@ -1725,25 +1818,44 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                             hasReachedReadyForCurrentTarget = true
                             ignoreNextReadyStallRecovery = false
 
-                            val cooldownPassed = (nowMs - lastLiveEdgeRecoveryMs) >= MIN_RECOVERY_COOLDOWN_MS
                             if (liveEdgeRecoveryEnabled &&
                                 wasAlreadyPlayingChannel &&
                                 !skipRecoveryThisReady &&
                                 !syncEngine.isRunning &&
-                                cooldownPassed &&
-                                stallDurationMs >= SIGNIFICANT_STALL_MS
+                                stallDurationMs >= MICRO_STALL_THRESHOLD_MS
                             ) {
-                                val isLiveSeekable = exo.isCurrentMediaItemLive || exo.isCurrentMediaItemDynamic
-                                if (isLiveSeekable) {
-                                    lastLiveEdgeRecoveryMs = nowMs
-                                    delayProcessor.markLiveEdgeJump(bumpGeneration = false)
-                                    try {
-                                        exo.seekToDefaultPosition()
-                                    } catch (_: Throwable) {
+                                // Tier 1: Absorb exact stall drift seamlessly inside the delay ring buffer
+                                // whenever delay headroom is available (zero reconnect, zero audio drop).
+                                val absorbedMs = delayProcessor.tryAbsorbExoStreamDriftMs(stallDurationMs)
+                                if (absorbedMs >= stallDurationMs) {
+                                    playbackHealthySinceMs = nowMs
+                                    updateState {
+                                        it.copy(
+                                            isPlaying = true,
+                                            isBuffering = false,
+                                            usingRelay = useRelayForCurrentUrl,
+                                            connectionStatus = if (useRelayForCurrentUrl) {
+                                                "متصل (ICY Relay) • تعويض تلقائي"
+                                            } else {
+                                                "متصل (مباشر) • تعويض تلقائي"
+                                            }
+                                        )
                                     }
+                                    updateNotification()
+                                    return
+                                }
+
+                                // Tier 2: When delay = 0s (or headroom is exhausted), track cumulative drift
+                                // and jump straight to the live edge as soon as drift reaches 0.6s.
+                                unrecoveredDriftMs += (stallDurationMs - absorbedMs).coerceAtLeast(0L)
+                                val adaptiveCooldownMs = if (consecutiveStallRecoveries >= 3) {
+                                    EXTENDED_RECOVERY_COOLDOWN_MS
                                 } else {
-                                    // Progressive HTTP / Icecast / MP3 / AAC streams resume from stale buffered packets
-                                    // unless we open a fresh socket at the live edge while preserving the delay ring buffer.
+                                    MIN_RECOVERY_COOLDOWN_MS
+                                }
+                                val cooldownPassed = (nowMs - lastLiveEdgeRecoveryMs) >= adaptiveCooldownMs
+                                if (cooldownPassed && unrecoveredDriftMs >= LIVE_RECONNECT_DRIFT_THRESHOLD_MS) {
+                                    unrecoveredDriftMs = 0L
                                     consecutiveStallRecoveries++
                                     performLiveEdgeRecovery(
                                         reasonLabel = "تعويض التقطيع • القفز للبث المباشر…",
@@ -1872,11 +1984,13 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             if (isReconnect && liveEdgeRecoveryEnabled) {
                 delayProcessor.prepareForSameChannelLiveReconnect(bumpGeneration = syncEngine.isRunning)
                 lastLiveEdgeRecoveryMs = SystemClock.elapsedRealtime()
+                unrecoveredDriftMs = 0L
             }
             ignoreNextReadyStallRecovery = true
             bufferingSinceMs = SystemClock.elapsedRealtime()
             consecutiveZeroByteTicks = 0
             exo.stop()
+            exo.clearMediaItems()
             val mediaItem = MediaItem.Builder()
                 .setUri(playableUrl)
                 .apply {
@@ -1909,6 +2023,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         mainHandler.removeCallbacks(reconnectRunnable)
         val nowMs = SystemClock.elapsedRealtime()
         lastLiveEdgeRecoveryMs = nowMs
+        unrecoveredDriftMs = 0L
         consecutiveZeroByteTicks = 0
 
         val exo = player
@@ -2289,9 +2404,11 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         private const val LIVE_RECOVERY_MAX_BACKOFF_MS = 2_500L
         private const val MAX_RECONNECT_MS = 5_000L
         private const val HEALTHY_RESET_MS = 8_000L
-        private const val SIGNIFICANT_STALL_MS = 2_500L
-        private const val PROLONGED_STALL_WATCHDOG_MS = 4_500L
-        private const val MIN_RECOVERY_COOLDOWN_MS = 8_000L
+        private const val MICRO_STALL_THRESHOLD_MS = 200L
+        private const val LIVE_RECONNECT_DRIFT_THRESHOLD_MS = 600L
+        private const val PROLONGED_STALL_WATCHDOG_MS = 4_000L
+        private const val MIN_RECOVERY_COOLDOWN_MS = 4_000L
+        private const val EXTENDED_RECOVERY_COOLDOWN_MS = 8_000L
         private const val ZOMBIE_SOCKET_ZERO_BYTE_TICKS = 4
         private const val ZOMBIE_SOCKET_MIN_STALL_MS = 3_500L
         private const val LIVE_EDGE_PREFS_NAME = "footsync_live_edge_prefs"
