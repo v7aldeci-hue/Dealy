@@ -13,6 +13,10 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
@@ -99,7 +103,8 @@ data class ServiceUiState(
     val syncStatusText: String = "",
     val syncHasCandidate: Boolean = false,
     val syncCandidateSec: Double? = null,
-    val lastSyncBannerText: String = ""
+    val lastSyncBannerText: String = "",
+    val liveEdgeRecoveryEnabled: Boolean = true
 )
 
 /**
@@ -122,7 +127,10 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
 
     private var totalFramesWritten = 0L
     private var anchorWriteTimeNs = Long.MIN_VALUE
+    private var lastWriteEndNs = Long.MIN_VALUE
     private var streamGeneration = 0L
+    private var preserveBufferOnNextResetAndConfigure = false
+    private var pendingGapFillAfterReconnect = false
 
     @Volatile
     private var requestedDelayMs = 0L
@@ -132,6 +140,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
     private var previousDelayFrames = 0L
     private var crossfadeRemaining = 0
     private var crossfadeTotal = 0
+    private var resumeFadeRemaining = 0
+    private var resumeFadeTotal = 0
 
     @Volatile
     private var sinkLatencyNs = DEFAULT_SINK_LATENCY_NS
@@ -168,9 +178,53 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         streamGeneration++
         totalFramesWritten = 0L
         anchorWriteTimeNs = Long.MIN_VALUE
+        lastWriteEndNs = Long.MIN_VALUE
+        preserveBufferOnNextResetAndConfigure = false
+        pendingGapFillAfterReconnect = false
         crossfadeRemaining = 0
+        resumeFadeRemaining = 0
         activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
         previousDelayFrames = activeDelayFrames
+    }
+
+    /**
+     * Preserves the existing PCM delay ring buffer across a same-channel live-edge reconnect
+     * so delayed playback resumes immediately in sync with TV instead of waiting in silence
+     * for the buffer to refill.
+     */
+    fun prepareForSameChannelLiveReconnect(bumpGeneration: Boolean = false) = synchronized(ringLock) {
+        if (ringBuffer.isNotEmpty() && totalFramesWritten > 0L && lastWriteEndNs != Long.MIN_VALUE) {
+            preserveBufferOnNextResetAndConfigure = true
+            pendingGapFillAfterReconnect = true
+            if (bumpGeneration) {
+                streamGeneration++
+            }
+        }
+        crossfadeRemaining = 0
+    }
+
+    /**
+     * Marks an in-place live-edge jump (e.g., HLS seekToDefaultPosition) so the next PCM chunk
+     * advances the ring buffer by the exact elapsed wall-clock outage gap.
+     */
+    fun markLiveEdgeJump(bumpGeneration: Boolean = false) = synchronized(ringLock) {
+        if (ringBuffer.isNotEmpty() && totalFramesWritten > 0L && lastWriteEndNs != Long.MIN_VALUE) {
+            pendingGapFillAfterReconnect = true
+            if (bumpGeneration) {
+                streamGeneration++
+            }
+        }
+        crossfadeRemaining = 0
+    }
+
+    /**
+     * Ensures final teardown releases ring memory even if a live-edge reconnect was pending.
+     */
+    fun releaseResources() = synchronized(ringLock) {
+        preserveBufferOnNextResetAndConfigure = false
+        pendingGapFillAfterReconnect = false
+        lastWriteEndNs = Long.MIN_VALUE
+        resumeFadeRemaining = 0
     }
 
     override fun onConfigure(
@@ -186,24 +240,42 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         }
 
         synchronized(ringLock) {
-            val needRealloc = ringBuffer.isEmpty() ||
-                newSr != sampleRate ||
-                newCh != channelCount
-            sampleRate = newSr
-            channelCount = newCh
-            capacityFrames = sampleRate * BUFFER_CAPACITY_SECONDS
-            if (needRealloc) {
-                ringBuffer = ShortArray(capacityFrames * channelCount)
-                maxScratchFrames = sampleRate
-                scratchIn = ShortArray(maxScratchFrames * channelCount)
+            val sameFormatWithHistory = preserveBufferOnNextResetAndConfigure &&
+                ringBuffer.isNotEmpty() &&
+                totalFramesWritten > 0L &&
+                newSr == sampleRate &&
+                newCh == channelCount
+
+            preserveBufferOnNextResetAndConfigure = false
+
+            if (sameFormatWithHistory) {
+                activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
+                previousDelayFrames = activeDelayFrames
+                crossfadeRemaining = 0
+                crossfadeTotal = (sampleRate / 100).coerceIn(64, 1024)
+            } else {
+                val needRealloc = ringBuffer.isEmpty() ||
+                    newSr != sampleRate ||
+                    newCh != channelCount
+                sampleRate = newSr
+                channelCount = newCh
+                capacityFrames = sampleRate * BUFFER_CAPACITY_SECONDS
+                if (needRealloc) {
+                    ringBuffer = ShortArray(capacityFrames * channelCount)
+                    maxScratchFrames = sampleRate
+                    scratchIn = ShortArray(maxScratchFrames * channelCount)
+                }
+                streamGeneration++
+                totalFramesWritten = 0L
+                anchorWriteTimeNs = Long.MIN_VALUE
+                lastWriteEndNs = Long.MIN_VALUE
+                pendingGapFillAfterReconnect = false
+                activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
+                previousDelayFrames = activeDelayFrames
+                crossfadeRemaining = 0
+                resumeFadeRemaining = 0
+                crossfadeTotal = (sampleRate / 100).coerceIn(64, 1024)
             }
-            streamGeneration++
-            totalFramesWritten = 0L
-            anchorWriteTimeNs = Long.MIN_VALUE
-            activeDelayFrames = delayMsToFramesLocked(requestedDelayMs)
-            previousDelayFrames = activeDelayFrames
-            crossfadeRemaining = 0
-            crossfadeTotal = (sampleRate / 100).coerceIn(64, 1024)
         }
 
         val prewarmBytes = (sampleRate / 4) * channelCount * 2
@@ -251,6 +323,26 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
 
             val cap = capacityFrames.toLong()
 
+            if (pendingGapFillAfterReconnect) {
+                pendingGapFillAfterReconnect = false
+                if (lastWriteEndNs != Long.MIN_VALUE && totalFramesWritten > 0L && sampleRate > 0) {
+                    val gapNs = measuredWriteStartNs - lastWriteEndNs
+                    if (gapNs > MIN_GAP_FILL_NS) {
+                        val gapMs = gapNs / 1_000_000L
+                        val gapFrames = (gapMs * sampleRate.toLong()) / 1_000L
+                        if (gapFrames >= cap) {
+                            ringBuffer.fill(0.toShort())
+                            totalFramesWritten += gapFrames
+                            anchorWriteTimeNs = Long.MIN_VALUE
+                        } else if (gapFrames > 0L) {
+                            fillSilenceGapLocked(gapFrames)
+                        }
+                        resumeFadeTotal = (sampleRate / 50).coerceIn(128, 1024)
+                        resumeFadeRemaining = resumeFadeTotal
+                    }
+                }
+            }
+
             if (anchorWriteTimeNs == Long.MIN_VALUE) {
                 anchorWriteTimeNs = measuredWriteStartNs -
                     (totalFramesWritten * NANOS_PER_SEC) / sampleRate.toLong()
@@ -279,10 +371,21 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                     val writeSlot = (totalFramesWritten % cap).toInt()
                     val writeBase = writeSlot * channelCount
                     val inBase = f * channelCount
+                    val resumeGain = nextResumeFadeGainLocked()
                     for (c in 0 until channelCount) {
                         val s = scratchIn[inBase + c]
                         ringBuffer[writeBase + c] = s
-                        outBuf.putShort(if (muteOut) 0 else s)
+                        if (muteOut) {
+                            outBuf.putShort(0)
+                        } else if (resumeGain < 1.0f) {
+                            val ramped = (s * resumeGain)
+                                .toInt()
+                                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                                .toShort()
+                            outBuf.putShort(ramped)
+                        } else {
+                            outBuf.putShort(s)
+                        }
                     }
                     totalFramesWritten++
                 }
@@ -297,6 +400,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                     }
                     totalFramesWritten++
                     val oldestAvailable = max(0L, totalFramesWritten - cap)
+                    val resumeGain = nextResumeFadeGainLocked()
 
                     val newReadFrame = writeFrame - activeDelayFrames
                     if (crossfadeRemaining > 0) {
@@ -314,7 +418,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                             for (c in 0 until channelCount) {
                                 val sOld = readSampleLocked(oldReadFrame, oldestAvailable, c)
                                 val sNew = readSampleLocked(newReadFrame, oldestAvailable, c)
-                                val mixed = (sOld * fadeOut + sNew * fadeIn)
+                                val mixed = ((sOld * fadeOut + sNew * fadeIn) * resumeGain)
                                     .toInt()
                                     .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                                     .toShort()
@@ -326,6 +430,15 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                             for (c in 0 until channelCount) {
                                 outBuf.putShort(0)
                             }
+                        } else if (resumeGain < 1.0f) {
+                            for (c in 0 until channelCount) {
+                                val sOut = readSampleLocked(newReadFrame, oldestAvailable, c)
+                                val ramped = (sOut * resumeGain)
+                                    .toInt()
+                                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                                    .toShort()
+                                outBuf.putShort(ramped)
+                            }
                         } else {
                             for (c in 0 until channelCount) {
                                 outBuf.putShort(readSampleLocked(newReadFrame, oldestAvailable, c))
@@ -334,6 +447,8 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
                     }
                 }
             }
+
+            lastWriteEndNs = nowNs
         }
 
         outBuf.flip()
@@ -366,12 +481,54 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         }
     }
 
+    private fun fillSilenceGapLocked(gapFrames: Long) {
+        val cap = capacityFrames.toLong()
+        val maxShorts = ringBuffer.size
+        if (cap <= 0L || channelCount <= 0 || maxShorts <= 0 || gapFrames <= 0L) return
+        if (gapFrames >= cap) {
+            ringBuffer.fill(0.toShort())
+            totalFramesWritten += gapFrames
+            return
+        }
+        val countFrames = gapFrames.toInt()
+        val startSlot = (totalFramesWritten % cap).toInt()
+        val firstPartFrames = min(countFrames, capacityFrames - startSlot)
+        val firstFrom = (startSlot * channelCount).coerceIn(0, maxShorts)
+        val firstTo = ((startSlot + firstPartFrames) * channelCount).coerceIn(firstFrom, maxShorts)
+        if (firstTo > firstFrom) {
+            ringBuffer.fill(0.toShort(), firstFrom, firstTo)
+        }
+
+        val remainingFrames = countFrames - firstPartFrames
+        if (remainingFrames > 0) {
+            val secondTo = (remainingFrames * channelCount).coerceIn(0, maxShorts)
+            if (secondTo > 0) {
+                ringBuffer.fill(0.toShort(), 0, secondTo)
+            }
+        }
+        totalFramesWritten += gapFrames
+    }
+
+    private fun nextResumeFadeGainLocked(): Float {
+        if (resumeFadeRemaining <= 0) return 1.0f
+        val progress = 1.0 - (resumeFadeRemaining.toDouble() / max(1, resumeFadeTotal).toDouble())
+        resumeFadeRemaining--
+        return (0.5 - 0.5 * cos(PI * progress)).toFloat()
+    }
+
     override fun onReset() {
         synchronized(ringLock) {
+            crossfadeRemaining = 0
+            if (preserveBufferOnNextResetAndConfigure && ringBuffer.isNotEmpty() && totalFramesWritten > 0L) {
+                return
+            }
             streamGeneration++
             totalFramesWritten = 0L
             anchorWriteTimeNs = Long.MIN_VALUE
-            crossfadeRemaining = 0
+            lastWriteEndNs = Long.MIN_VALUE
+            preserveBufferOnNextResetAndConfigure = false
+            pendingGapFillAfterReconnect = false
+            resumeFadeRemaining = 0
             ringBuffer = ShortArray(0)
             scratchIn = ShortArray(0)
             maxScratchFrames = 0
@@ -429,6 +586,7 @@ class DelayAudioProcessor : BaseAudioProcessor(), RadioPcmSource {
         const val MAX_DELAY_SECONDS = 180.0
         private const val BUFFER_CAPACITY_SECONDS = 185
         private const val NANOS_PER_SEC = 1_000_000_000L
+        private const val MIN_GAP_FILL_NS = 250_000_000L
         private const val DEFAULT_SINK_LATENCY_NS = 120_000_000L
         private const val MAX_SINK_LATENCY_NS = 2_500_000_000L
     }
@@ -676,14 +834,14 @@ class StreamRelay(
     private fun openUpstreamSocket(host: String, port: Int, isHttps: Boolean): Socket {
         val raw = Socket()
         raw.receiveBufferSize = RELAY_BUFFER_BYTES * 2
-        raw.connect(InetSocketAddress(host, port), 15_000)
-        raw.soTimeout = 15_000
+        raw.connect(InetSocketAddress(host, port), 8_000)
+        raw.soTimeout = 10_000
         raw.tcpNoDelay = true
         if (!isHttps) return raw
 
         val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
         val ssl = factory.createSocket(raw, host, port, true) as SSLSocket
-        ssl.soTimeout = 15_000
+        ssl.soTimeout = 10_000
         ssl.startHandshake()
         return ssl
     }
@@ -809,6 +967,20 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     private var reconnectBackoffMs = INITIAL_RECONNECT_MS
     private var playbackHealthySinceMs = 0L
 
+    // Live Edge Recovery state
+    private var liveEdgeRecoveryEnabled = true
+    private var hasReachedReadyForCurrentTarget = false
+    private var ignoreNextReadyStallRecovery = false
+    private var bufferingSinceMs = 0L
+    private var pausedSinceMs = 0L
+    private var lastLiveEdgeRecoveryMs = 0L
+    private var consecutiveStallRecoveries = 0
+    private var consecutiveZeroByteTicks = 0
+    private var networkLostWhilePlaying = false
+    private var networkCallbackRegistered = false
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
     private val bytesInCurrentWindow = AtomicLong(0L)
     private var lastSpeedSampleTimeMs = 0L
     private var currentSpeedKbps = 0.0
@@ -865,8 +1037,43 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
             }
             lastSpeedSampleTimeMs = nowMs
 
-            if (playbackHealthySinceMs > 0L && (nowMs - playbackHealthySinceMs) > 4000L) {
+            if (bytes > 0L) {
+                consecutiveZeroByteTicks = 0
+            } else if (shouldStayAlive && !userStopped) {
+                consecutiveZeroByteTicks++
+            } else {
+                consecutiveZeroByteTicks = 0
+            }
+
+            if (playbackHealthySinceMs > 0L && (nowMs - playbackHealthySinceMs) > HEALTHY_RESET_MS) {
                 reconnectBackoffMs = INITIAL_RECONNECT_MS
+                consecutiveStallRecoveries = 0
+            }
+
+            if (liveEdgeRecoveryEnabled &&
+                shouldStayAlive &&
+                !userStopped &&
+                !syncEngine.isRunning &&
+                hasReachedReadyForCurrentTarget &&
+                bufferingSinceMs > 0L
+            ) {
+                val stalledForMs = nowMs - bufferingSinceMs
+                val adaptiveWatchdogMs = when {
+                    consecutiveStallRecoveries >= 3 -> PROLONGED_STALL_WATCHDOG_MS * 2L + 1_000L
+                    consecutiveStallRecoveries == 2 -> PROLONGED_STALL_WATCHDOG_MS + 3_000L
+                    else -> PROLONGED_STALL_WATCHDOG_MS
+                }
+                val cooldownPassed = (nowMs - lastLiveEdgeRecoveryMs) >= MIN_RECOVERY_COOLDOWN_MS
+                val zombieSocketStalled = consecutiveZeroByteTicks >= ZOMBIE_SOCKET_ZERO_BYTE_TICKS &&
+                    stalledForMs >= ZOMBIE_SOCKET_MIN_STALL_MS
+
+                if (cooldownPassed && (stalledForMs >= adaptiveWatchdogMs || zombieSocketStalled)) {
+                    consecutiveStallRecoveries++
+                    performLiveEdgeRecovery(
+                        reasonLabel = "تجاوز التقطيع • القفز للبث المباشر…",
+                        forceHardReconnect = true
+                    )
+                }
             }
 
             val bufSec = delayProcessor.getBufferedHistorySeconds()
@@ -897,8 +1104,12 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         syncEngine = SyncEngine(applicationContext, delayProcessor, this)
         overlayController = FloatingOverlayController(this, this)
 
+        liveEdgeRecoveryEnabled = loadLiveEdgeRecoveryPref()
+        uiState = uiState.copy(liveEdgeRecoveryEnabled = liveEdgeRecoveryEnabled)
+
         initLocks()
         initPlayer()
+        registerNetworkRecoveryCallback()
 
         lastSpeedSampleTimeMs = SystemClock.elapsedRealtime()
         mainHandler.postDelayed(telemetryRunnable, TELEMETRY_INTERVAL_MS)
@@ -942,6 +1153,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         if (syncEngine.isRunning) {
             syncEngine.cancel()
         }
+        unregisterNetworkRecoveryCallback()
         overlayController.hide()
         streamRelay.stop()
         releasePlayer()
@@ -991,6 +1203,13 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         }
 
         reconnectBackoffMs = INITIAL_RECONNECT_MS
+        hasReachedReadyForCurrentTarget = false
+        ignoreNextReadyStallRecovery = true
+        bufferingSinceMs = SystemClock.elapsedRealtime()
+        pausedSinceMs = 0L
+        consecutiveStallRecoveries = 0
+        consecutiveZeroByteTicks = 0
+        networkLostWhilePlaying = false
         bytesInCurrentWindow.set(0L)
         currentSpeedKbps = 0.0
 
@@ -1006,7 +1225,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                 isPlaying = true,
                 isBuffering = true,
                 connectionStatus = "جاري الاتصال…",
-                lastSyncBannerText = ""
+                lastSyncBannerText = "",
+                liveEdgeRecoveryEnabled = liveEdgeRecoveryEnabled
             )
         }
 
@@ -1034,6 +1254,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
         if (p.playWhenReady && (p.playbackState == Player.STATE_READY || p.playbackState == Player.STATE_BUFFERING)) {
             shouldStayAlive = false
+            bufferingSinceMs = 0L
+            pausedSinceMs = SystemClock.elapsedRealtime()
             mainHandler.removeCallbacks(reconnectRunnable)
             p.playWhenReady = false
             releaseLocks()
@@ -1049,10 +1271,21 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         } else {
             userStopped = false
             shouldStayAlive = true
+            val pausedDurationMs = if (pausedSinceMs > 0L) {
+                SystemClock.elapsedRealtime() - pausedSinceMs
+            } else {
+                0L
+            }
+            pausedSinceMs = 0L
             ensureForegroundStarted()
             acquireLocks()
             if (p.playbackState == Player.STATE_IDLE || p.playbackState == Player.STATE_ENDED) {
-                startStreamForTarget(target, isReconnect = false)
+                startStreamForTarget(target, isReconnect = liveEdgeRecoveryEnabled)
+            } else if (liveEdgeRecoveryEnabled && pausedDurationMs >= SIGNIFICANT_STALL_MS) {
+                performLiveEdgeRecovery(
+                    reasonLabel = "القفز للبث المباشر…",
+                    forceHardReconnect = !(p.isCurrentMediaItemLive || p.isCurrentMediaItemDynamic)
+                )
             } else {
                 p.playWhenReady = true
                 updateState {
@@ -1097,6 +1330,18 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     fun resetDelay() {
         setDelaySeconds(0.0, persistForUrl = true)
     }
+
+    fun setLiveEdgeRecoveryEnabled(enabled: Boolean) {
+        liveEdgeRecoveryEnabled = enabled
+        saveLiveEdgeRecoveryPref(enabled)
+        if (!enabled) {
+            consecutiveStallRecoveries = 0
+            networkLostWhilePlaying = false
+        }
+        updateState { it.copy(liveEdgeRecoveryEnabled = enabled) }
+    }
+
+    fun isLiveEdgeRecoveryEnabled(): Boolean = liveEdgeRecoveryEnabled
 
     fun startAutoSync(): Boolean {
         if (syncEngine.isRunning) return true
@@ -1180,6 +1425,10 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         if (syncEngine.isRunning) {
             syncEngine.cancel()
         }
+        bufferingSinceMs = 0L
+        pausedSinceMs = 0L
+        networkLostWhilePlaying = false
+        delayProcessor.releaseResources()
         overlayController.hide()
         streamRelay.stop()
         player?.stop()
@@ -1409,8 +1658,8 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("FootSyncRadio/1.0 (Android)")
             .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15_000)
-            .setReadTimeoutMs(15_000)
+            .setConnectTimeoutMs(8_000)
+            .setReadTimeoutMs(8_000)
             .setTransferListener(directTransferListener)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(this)
@@ -1418,10 +1667,10 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                15_000,
-                50_000,
-                2_500,
-                5_000
+                4_000,
+                10_000,
+                1_200,
+                1_500
             )
             .build()
 
@@ -1441,9 +1690,13 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
         exo.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
+                val nowMs = SystemClock.elapsedRealtime()
                 when (playbackState) {
                     Player.STATE_BUFFERING -> {
                         playbackHealthySinceMs = 0L
+                        if (bufferingSinceMs == 0L) {
+                            bufferingSinceMs = nowMs
+                        }
                         updateState {
                             it.copy(
                                 isBuffering = true,
@@ -1458,8 +1711,49 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                     }
 
                     Player.STATE_READY -> {
+                        val stallDurationMs = if (bufferingSinceMs > 0L) {
+                            nowMs - bufferingSinceMs
+                        } else {
+                            0L
+                        }
+                        bufferingSinceMs = 0L
+                        networkLostWhilePlaying = false
+
                         if (exo.playWhenReady) {
-                            playbackHealthySinceMs = SystemClock.elapsedRealtime()
+                            val wasAlreadyPlayingChannel = hasReachedReadyForCurrentTarget
+                            val skipRecoveryThisReady = ignoreNextReadyStallRecovery
+                            hasReachedReadyForCurrentTarget = true
+                            ignoreNextReadyStallRecovery = false
+
+                            val cooldownPassed = (nowMs - lastLiveEdgeRecoveryMs) >= MIN_RECOVERY_COOLDOWN_MS
+                            if (liveEdgeRecoveryEnabled &&
+                                wasAlreadyPlayingChannel &&
+                                !skipRecoveryThisReady &&
+                                !syncEngine.isRunning &&
+                                cooldownPassed &&
+                                stallDurationMs >= SIGNIFICANT_STALL_MS
+                            ) {
+                                val isLiveSeekable = exo.isCurrentMediaItemLive || exo.isCurrentMediaItemDynamic
+                                if (isLiveSeekable) {
+                                    lastLiveEdgeRecoveryMs = nowMs
+                                    delayProcessor.markLiveEdgeJump(bumpGeneration = false)
+                                    try {
+                                        exo.seekToDefaultPosition()
+                                    } catch (_: Throwable) {
+                                    }
+                                } else {
+                                    // Progressive HTTP / Icecast / MP3 / AAC streams resume from stale buffered packets
+                                    // unless we open a fresh socket at the live edge while preserving the delay ring buffer.
+                                    consecutiveStallRecoveries++
+                                    performLiveEdgeRecovery(
+                                        reasonLabel = "تعويض التقطيع • القفز للبث المباشر…",
+                                        forceHardReconnect = true
+                                    )
+                                    return
+                                }
+                            }
+
+                            playbackHealthySinceMs = nowMs
                             updateState {
                                 it.copy(
                                     isPlaying = true,
@@ -1477,8 +1771,13 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
                     }
 
                     Player.STATE_ENDED -> {
+                        bufferingSinceMs = 0L
+                        playbackHealthySinceMs = 0L
                         if (shouldStayAlive && !userStopped) {
-                            scheduleAutoReconnect("انقطع البث • إعادة الاتصال…")
+                            if (liveEdgeRecoveryEnabled) {
+                                reconnectBackoffMs = min(reconnectBackoffMs, FAST_LIVE_RECONNECT_MS)
+                            }
+                            scheduleAutoReconnect("انقطع البث • القفز للبث المباشر…")
                         }
                     }
 
@@ -1488,6 +1787,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
 
             override fun onPlayerError(error: PlaybackException) {
                 if (!shouldStayAlive || userStopped) return
+                bufferingSinceMs = 0L
                 playbackHealthySinceMs = 0L
 
                 val target = currentTarget
@@ -1569,8 +1869,27 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         }
 
         try {
+            if (isReconnect && liveEdgeRecoveryEnabled) {
+                delayProcessor.prepareForSameChannelLiveReconnect(bumpGeneration = syncEngine.isRunning)
+                lastLiveEdgeRecoveryMs = SystemClock.elapsedRealtime()
+            }
+            ignoreNextReadyStallRecovery = true
+            bufferingSinceMs = SystemClock.elapsedRealtime()
+            consecutiveZeroByteTicks = 0
             exo.stop()
-            exo.setMediaItem(MediaItem.fromUri(playableUrl))
+            val mediaItem = MediaItem.Builder()
+                .setUri(playableUrl)
+                .apply {
+                    if (liveEdgeRecoveryEnabled) {
+                        setLiveConfiguration(
+                            MediaItem.LiveConfiguration.Builder()
+                                .setTargetOffsetMs(C.TIME_UNSET)
+                                .build()
+                        )
+                    }
+                }
+                .build()
+            exo.setMediaItem(mediaItem)
             exo.prepare()
             exo.playWhenReady = true
             delayProcessor.setOutputMuted(isMuted)
@@ -1580,10 +1899,144 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         }
     }
 
+    private fun performLiveEdgeRecovery(
+        reasonLabel: String,
+        forceHardReconnect: Boolean
+    ) {
+        val target = currentTarget ?: return
+        if (!shouldStayAlive || userStopped || !liveEdgeRecoveryEnabled) return
+
+        mainHandler.removeCallbacks(reconnectRunnable)
+        val nowMs = SystemClock.elapsedRealtime()
+        lastLiveEdgeRecoveryMs = nowMs
+        consecutiveZeroByteTicks = 0
+
+        val exo = player
+        val canFastSeekLive = !forceHardReconnect &&
+            exo != null &&
+            (exo.isCurrentMediaItemLive || exo.isCurrentMediaItemDynamic) &&
+            (exo.playbackState == Player.STATE_READY || exo.playbackState == Player.STATE_BUFFERING)
+
+        if (canFastSeekLive && exo != null) {
+            try {
+                ignoreNextReadyStallRecovery = true
+                bufferingSinceMs = nowMs
+                delayProcessor.markLiveEdgeJump(bumpGeneration = syncEngine.isRunning)
+                exo.seekToDefaultPosition()
+                exo.playWhenReady = true
+                updateState {
+                    it.copy(
+                        isPlaying = true,
+                        isBuffering = exo.playbackState == Player.STATE_BUFFERING,
+                        connectionStatus = reasonLabel
+                    )
+                }
+                updateNotification()
+                return
+            } catch (_: Throwable) {
+            }
+        }
+
+        reconnectBackoffMs = min(reconnectBackoffMs, FAST_LIVE_RECONNECT_MS)
+        startStreamForTarget(target, isReconnect = true)
+        updateState {
+            it.copy(
+                isBuffering = true,
+                connectionStatus = reasonLabel
+            )
+        }
+        updateNotification()
+    }
+
+    private fun registerNetworkRecoveryCallback() {
+        if (networkCallbackRegistered) return
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            connectivityManager = cm
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onLost(network: Network) {
+                    mainHandler.post {
+                        if (shouldStayAlive && !userStopped) {
+                            networkLostWhilePlaying = true
+                        }
+                    }
+                }
+
+                override fun onAvailable(network: Network) {
+                    mainHandler.post {
+                        handleNetworkRestored()
+                    }
+                }
+            }
+            cm.registerNetworkCallback(request, cb)
+            networkCallback = cb
+            networkCallbackRegistered = true
+        } catch (_: Throwable) {
+            networkCallbackRegistered = false
+        }
+    }
+
+    private fun unregisterNetworkRecoveryCallback() {
+        if (!networkCallbackRegistered) return
+        try {
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+        } catch (_: Throwable) {
+        }
+        networkCallback = null
+        networkCallbackRegistered = false
+    }
+
+    private fun handleNetworkRestored() {
+        if (!liveEdgeRecoveryEnabled || !shouldStayAlive || userStopped || syncEngine.isRunning) return
+        val exo = player ?: return
+        val wasStalledOrDisconnected = networkLostWhilePlaying ||
+            bufferingSinceMs > 0L ||
+            exo.playbackState == Player.STATE_BUFFERING ||
+            exo.playbackState == Player.STATE_IDLE ||
+            exo.playbackState == Player.STATE_ENDED
+
+        if (!wasStalledOrDisconnected) return
+        networkLostWhilePlaying = false
+        reconnectBackoffMs = INITIAL_RECONNECT_MS
+
+        val nowMs = SystemClock.elapsedRealtime()
+        if ((nowMs - lastLiveEdgeRecoveryMs) < 1_500L) return
+
+        performLiveEdgeRecovery(
+            reasonLabel = "عودة الاتصال • القفز للبث المباشر…",
+            forceHardReconnect = true
+        )
+    }
+
+    private fun loadLiveEdgeRecoveryPref(): Boolean {
+        return try {
+            applicationContext
+                .getSharedPreferences(LIVE_EDGE_PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_LIVE_EDGE_RECOVERY, true)
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    private fun saveLiveEdgeRecoveryPref(enabled: Boolean) {
+        try {
+            applicationContext
+                .getSharedPreferences(LIVE_EDGE_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_LIVE_EDGE_RECOVERY, enabled)
+                .apply()
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun scheduleAutoReconnect(reasonText: String) {
         mainHandler.removeCallbacks(reconnectRunnable)
-        val waitMs = reconnectBackoffMs
-        reconnectBackoffMs = min(MAX_RECONNECT_MS, reconnectBackoffMs * 2L)
+        val capMs = if (liveEdgeRecoveryEnabled) LIVE_RECOVERY_MAX_BACKOFF_MS else MAX_RECONNECT_MS
+        val waitMs = min(reconnectBackoffMs, capMs)
+        reconnectBackoffMs = min(capMs, max(INITIAL_RECONNECT_MS, reconnectBackoffMs * 2L))
 
         updateState {
             it.copy(
@@ -1597,6 +2050,7 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
     }
 
     private fun releasePlayer() {
+        delayProcessor.releaseResources()
         try {
             player?.release()
         } catch (_: Throwable) {
@@ -1831,7 +2285,17 @@ class RadioPlaybackService : Service(), SyncListener, OverlayCallbacks {
         private const val REQUEST_RESTART_ALARM = 4102
         private const val TELEMETRY_INTERVAL_MS = 1_000L
         private const val INITIAL_RECONNECT_MS = 250L
+        private const val FAST_LIVE_RECONNECT_MS = 400L
+        private const val LIVE_RECOVERY_MAX_BACKOFF_MS = 2_500L
         private const val MAX_RECONNECT_MS = 5_000L
+        private const val HEALTHY_RESET_MS = 8_000L
+        private const val SIGNIFICANT_STALL_MS = 2_500L
+        private const val PROLONGED_STALL_WATCHDOG_MS = 4_500L
+        private const val MIN_RECOVERY_COOLDOWN_MS = 8_000L
+        private const val ZOMBIE_SOCKET_ZERO_BYTE_TICKS = 4
+        private const val ZOMBIE_SOCKET_MIN_STALL_MS = 3_500L
+        private const val LIVE_EDGE_PREFS_NAME = "footsync_live_edge_prefs"
+        private const val KEY_LIVE_EDGE_RECOVERY = "live_edge_recovery_enabled"
 
         const val ACTION_PREV = "com.footsync.radio.ACTION_PREV"
         const val ACTION_NEXT = "com.footsync.radio.ACTION_NEXT"
