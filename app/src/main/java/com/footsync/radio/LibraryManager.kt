@@ -116,7 +116,7 @@ class FootSyncPrefs(context: Context) {
     fun getActiveLibraryId(): String? = prefs.getString(KEY_ACTIVE_LIBRARY_ID, null)
 
     fun setActiveLibraryId(id: String) {
-        prefs.edit().putString(KEY_ACTIVE_LIBRARY_ID, id).apply()
+        prefs.edit().putString(KEY_ACTIVE_LIBRARY_ID, id).commit()
     }
 
     fun getLastPlayingLibraryId(): String? = prefs.getString(KEY_LAST_PLAYING_LIB_ID, null)
@@ -127,7 +127,7 @@ class FootSyncPrefs(context: Context) {
         prefs.edit()
             .putString(KEY_LAST_PLAYING_LIB_ID, libraryId)
             .putInt(KEY_LAST_PLAYING_CH_INDEX, index.coerceAtLeast(0))
-            .apply()
+            .commit()
     }
 
     fun getOverlayX(defaultX: Int): Int = prefs.getInt(KEY_OVERLAY_X, defaultX)
@@ -655,6 +655,7 @@ class LibraryManager private constructor(context: Context) {
 
     private val appContext = context.applicationContext
     private val storageFile = File(appContext.filesDir, STORAGE_FILE_NAME)
+    private val mirrorPrefs = appContext.getSharedPreferences(MIRROR_PREFS_NAME, Context.MODE_PRIVATE)
     private val prefs = FootSyncPrefs(appContext)
     private val lock = Any()
 
@@ -664,7 +665,24 @@ class LibraryManager private constructor(context: Context) {
         loadFromDisk()
     }
 
+    /**
+     * Re-checks disk and SharedPreferences mirror if in-memory libraries currently contain
+     * no channels or imported libraries, ensuring saved libraries always reappear reliably.
+     */
+    fun ensureLoadedFromDisk() = synchronized(lock) {
+        val hasRealDataInRam = libraries.size > 1 || libraries.any { it.channels.isNotEmpty() }
+        if (!hasRealDataInRam) {
+            val recovered = readBestPersistedLibrariesLocked()
+            if (recovered != null && (recovered.size > 1 || recovered.any { it.channels.isNotEmpty() })) {
+                libraries.clear()
+                libraries.addAll(recovered)
+                ensureManualLibraryLocked()
+            }
+        }
+    }
+
     fun getLibraries(): List<RadioLibrary> = synchronized(lock) {
+        ensureLoadedFromDisk()
         libraries.map { lib ->
             lib.copy(channels = lib.channels.toMutableList())
         }
@@ -672,13 +690,17 @@ class LibraryManager private constructor(context: Context) {
 
     fun getLibraryById(libraryId: String?): RadioLibrary? = synchronized(lock) {
         if (libraryId == null) return@synchronized null
+        ensureLoadedFromDisk()
         libraries.firstOrNull { it.id == libraryId }
             ?.let { it.copy(channels = it.channels.toMutableList()) }
     }
 
     fun getActiveLibrary(): RadioLibrary = synchronized(lock) {
+        ensureLoadedFromDisk()
         val activeId = prefs.getActiveLibraryId()
-        val found = libraries.firstOrNull { it.id == activeId } ?: libraries.first()
+        val found = libraries.firstOrNull { it.id == activeId }
+            ?: libraries.firstOrNull { it.channels.isNotEmpty() }
+            ?: libraries.first()
         found.copy(channels = found.channels.toMutableList())
     }
 
@@ -875,6 +897,7 @@ class LibraryManager private constructor(context: Context) {
     }
 
     fun getTarget(libraryId: String, index: Int): PlaybackTarget? = synchronized(lock) {
+        ensureLoadedFromDisk()
         val lib = libraries.firstOrNull { it.id == libraryId } ?: return@synchronized null
         if (lib.channels.isEmpty()) return@synchronized null
         val safeIdx = index.coerceIn(0, lib.channels.lastIndex)
@@ -892,6 +915,7 @@ class LibraryManager private constructor(context: Context) {
      */
     fun stepChannel(libraryId: String?, currentIndex: Int, delta: Int): PlaybackTarget? =
         synchronized(lock) {
+            ensureLoadedFromDisk()
             val lib = libraries.firstOrNull { it.id == libraryId }
                 ?: libraries.firstOrNull { it.id == prefs.getActiveLibraryId() }
                 ?: libraries.firstOrNull { it.channels.isNotEmpty() }
@@ -912,6 +936,7 @@ class LibraryManager private constructor(context: Context) {
         }
 
     fun getLastOrFirstTarget(): PlaybackTarget? = synchronized(lock) {
+        ensureLoadedFromDisk()
         val lastLibId = prefs.getLastPlayingLibraryId()
         val lastIdx = prefs.getLastPlayingChannelIndex()
         if (lastLibId != null) {
@@ -996,53 +1021,102 @@ class LibraryManager private constructor(context: Context) {
 
     private fun loadFromDisk() = synchronized(lock) {
         libraries.clear()
-        val fileExisted = storageFile.exists() && storageFile.length() > 0L
-        var loadedCleanly = false
+        val fileLibs = readLibrariesFromFileLocked()
+        val mirrorLibs = readLibrariesFromMirrorLocked()
 
-        if (fileExisted) {
-            try {
-                val raw = storageFile.readText(StandardCharsets.UTF_8)
-                val root = JSONObject(raw)
-                val arr = root.optJSONArray("libraries") ?: JSONArray()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    val id = obj.optString("id", UUID.randomUUID().toString())
-                    val name = obj.optString("name", "مكتبة")
-                    val isManual = obj.optBoolean("isManualDefault", id == MANUAL_LIBRARY_ID)
-                    val chArr = obj.optJSONArray("channels") ?: JSONArray()
-                    val channels = mutableListOf<RadioChannel>()
-                    for (j in 0 until chArr.length()) {
-                        val cObj = chArr.optJSONObject(j) ?: continue
-                        val cUrl = cObj.optString("url", "").trim()
-                        if (cUrl.isEmpty()) continue
-                        val cId = cObj.optString("id", UUID.randomUUID().toString())
-                        val cName = cObj.optString("name", "قناة ${j + 1}")
-                        channels.add(RadioChannel(id = cId, name = cName, url = cUrl))
-                    }
-                    libraries.add(
-                        RadioLibrary(
-                            id = id,
-                            name = name,
-                            isManualDefault = isManual,
-                            channels = channels
-                        )
-                    )
-                }
-                loadedCleanly = true
-            } catch (_: Throwable) {
-                // Never overwrite an existing libraries.json if reading/parsing failed
-                libraries.clear()
-            }
+        val chosen = pickRicherLibraries(fileLibs, mirrorLibs)
+        if (chosen != null) {
+            libraries.addAll(chosen)
         }
 
         ensureManualLibraryLocked()
-        if (prefs.getActiveLibraryId().isNullOrEmpty()) {
-            prefs.setActiveLibraryId(libraries.first().id)
+
+        val activeId = prefs.getActiveLibraryId()
+        if (activeId.isNullOrEmpty() || libraries.none { it.id == activeId }) {
+            val preferred = libraries.firstOrNull { it.channels.isNotEmpty() } ?: libraries.first()
+            prefs.setActiveLibraryId(preferred.id)
         }
-        // Only write initial file if none existed yet
-        if (!fileExisted && !loadedCleanly) {
+
+        // Repair either storage copy if one was missing or stale
+        val fileMissingOrStale = fileLibs == null || scoreLibraries(chosen) > scoreLibraries(fileLibs)
+        val mirrorMissingOrStale = mirrorLibs == null || scoreLibraries(chosen) > scoreLibraries(mirrorLibs)
+        if (chosen == null || fileMissingOrStale || mirrorMissingOrStale) {
             saveToDiskLocked()
         }
+    }
+
+    private fun readBestPersistedLibrariesLocked(): List<RadioLibrary>? {
+        return pickRicherLibraries(readLibrariesFromFileLocked(), readLibrariesFromMirrorLocked())
+    }
+
+    private fun readLibrariesFromFileLocked(): List<RadioLibrary>? {
+        if (!storageFile.exists() || storageFile.length() <= 0L) return null
+        return try {
+            parseLibrariesJson(storageFile.readText(StandardCharsets.UTF_8))
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun readLibrariesFromMirrorLocked(): List<RadioLibrary>? {
+        val raw = try {
+            mirrorPrefs.getString(KEY_MIRROR_JSON, null)
+        } catch (_: Throwable) {
+            null
+        }
+        if (raw.isNullOrBlank()) return null
+        return try {
+            parseLibrariesJson(raw)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun parseLibrariesJson(raw: String): List<RadioLibrary> {
+        val parsed = mutableListOf<RadioLibrary>()
+        val root = JSONObject(raw)
+        val arr = root.optJSONArray("libraries") ?: JSONArray()
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val id = obj.optString("id", UUID.randomUUID().toString())
+            val name = obj.optString("name", "مكتبة")
+            val isManual = obj.optBoolean("isManualDefault", id == MANUAL_LIBRARY_ID)
+            val chArr = obj.optJSONArray("channels") ?: JSONArray()
+            val channels = mutableListOf<RadioChannel>()
+            for (j in 0 until chArr.length()) {
+                val cObj = chArr.optJSONObject(j) ?: continue
+                val cUrl = cObj.optString("url", "").trim()
+                if (cUrl.isEmpty()) continue
+                val cId = cObj.optString("id", UUID.randomUUID().toString())
+                val cName = cObj.optString("name", "قناة ${j + 1}")
+                channels.add(RadioChannel(id = cId, name = cName, url = cUrl))
+            }
+            parsed.add(
+                RadioLibrary(
+                    id = id,
+                    name = name,
+                    isManualDefault = isManual,
+                    channels = channels
+                )
+            )
+        }
+        return parsed
+    }
+
+    private fun scoreLibraries(list: List<RadioLibrary>?): Int {
+        if (list == null) return -1
+        val totalChannels = list.sumOf { it.channels.size }
+        val nonManualCount = list.count { !it.isManualDefault }
+        return totalChannels * 10 + nonManualCount * 5 + list.size
+    }
+
+    private fun pickRicherLibraries(
+        primary: List<RadioLibrary>?,
+        backup: List<RadioLibrary>?
+    ): List<RadioLibrary>? {
+        if (primary == null) return backup
+        if (backup == null) return primary
+        return if (scoreLibraries(backup) > scoreLibraries(primary)) backup else primary
     }
 
     private fun ensureManualLibraryLocked(): RadioLibrary {
@@ -1058,29 +1132,49 @@ class LibraryManager private constructor(context: Context) {
         return manual
     }
 
-    private fun saveToDiskLocked() {
-        try {
-            val root = JSONObject()
-            val arr = JSONArray()
-            for (lib in libraries) {
-                val obj = JSONObject()
-                obj.put("id", lib.id)
-                obj.put("name", lib.name)
-                obj.put("isManualDefault", lib.isManualDefault)
-                val chArr = JSONArray()
-                for (ch in lib.channels) {
-                    val cObj = JSONObject()
-                    cObj.put("id", ch.id)
-                    cObj.put("name", ch.name)
-                    cObj.put("url", ch.url)
-                    chArr.put(cObj)
-                }
-                obj.put("channels", chArr)
-                arr.put(obj)
+    private fun serializeLibrariesJsonLocked(): String {
+        val root = JSONObject()
+        val arr = JSONArray()
+        for (lib in libraries) {
+            val obj = JSONObject()
+            obj.put("id", lib.id)
+            obj.put("name", lib.name)
+            obj.put("isManualDefault", lib.isManualDefault)
+            val chArr = JSONArray()
+            for (ch in lib.channels) {
+                val cObj = JSONObject()
+                cObj.put("id", ch.id)
+                cObj.put("name", ch.name)
+                cObj.put("url", ch.url)
+                chArr.put(cObj)
             }
-            root.put("libraries", arr)
-            val jsonBytes = root.toString().toByteArray(StandardCharsets.UTF_8)
+            obj.put("channels", chArr)
+            arr.put(obj)
+        }
+        root.put("libraries", arr)
+        return root.toString()
+    }
 
+    private fun saveToDiskLocked() {
+        val jsonStr = try {
+            serializeLibrariesJsonLocked()
+        } catch (_: Throwable) {
+            return
+        }
+
+        // 1. Synchronous backup in SharedPreferences (survives instant swipe-kill reliably)
+        try {
+            mirrorPrefs.edit().putString(KEY_MIRROR_JSON, jsonStr).commit()
+        } catch (_: Throwable) {
+        }
+
+        // 2. Atomic file write to filesDir/libraries.json with safe fallback
+        try {
+            val parent = storageFile.parentFile
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs()
+            }
+            val jsonBytes = jsonStr.toByteArray(StandardCharsets.UTF_8)
             val tmp = File(appContext.filesDir, "$STORAGE_FILE_NAME.tmp")
             FileOutputStream(tmp).use { fos ->
                 fos.write(jsonBytes)
@@ -1091,17 +1185,22 @@ class LibraryManager private constructor(context: Context) {
                 }
             }
 
-            if (storageFile.exists() && !tmp.renameTo(storageFile)) {
-                storageFile.delete()
+            val renamed = tmp.renameTo(storageFile)
+            if (!renamed) {
+                if (storageFile.exists()) {
+                    storageFile.delete()
+                }
                 if (!tmp.renameTo(storageFile)) {
                     FileOutputStream(storageFile).use { fos ->
                         fos.write(jsonBytes)
                         fos.flush()
+                        try {
+                            fos.fd.sync()
+                        } catch (_: Throwable) {
+                        }
                     }
                     tmp.delete()
                 }
-            } else if (!storageFile.exists()) {
-                tmp.renameTo(storageFile)
             }
         } catch (_: Throwable) {
         }
@@ -1109,6 +1208,8 @@ class LibraryManager private constructor(context: Context) {
 
     companion object {
         private const val STORAGE_FILE_NAME = "libraries.json"
+        private const val MIRROR_PREFS_NAME = "footsync_libraries_mirror"
+        private const val KEY_MIRROR_JSON = "libraries_json_v1"
         const val MANUAL_LIBRARY_ID = "manual_default_library"
         const val MANUAL_LIBRARY_NAME = "روابط يدوية"
         private const val MAX_PLAYLIST_CHARS = 4 * 1024 * 1024
