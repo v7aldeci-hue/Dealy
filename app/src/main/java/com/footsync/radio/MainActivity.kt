@@ -569,10 +569,10 @@ class MainActivity : AppCompatActivity() {
         }
         centerArea.addView(tvHomeSyncSubtext)
 
-        // Sync result banner (confirmation / cancellation / error message) in app blue theme
+        // Sync result banner (confirmation / cancellation / error message) in app blue theme with crisp white text
         tvHomeBanner = TextView(this).apply {
             visibility = View.GONE
-            setTextColor(COLOR_SHAZAM_BLUE)
+            setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             typeface = appTypefaceBold
             gravity = Gravity.CENTER
@@ -1163,19 +1163,7 @@ class MainActivity : AppCompatActivity() {
         liveEdgeRow.addView(liveEdgeCol)
         liveEdgeRow.addView(swLiveEdgeRecovery)
 
-        val div1 = makeSubtleDivider()
-
-        val continuousNote = TextView(this).apply {
-            text = "المزامنة التلقائية تعمل بشكل مستمر دون مهلة زمنية حتى التحقق المزدوج أو الإلغاء يدوياً."
-            setTextColor(COLOR_GRAY_SUBTITLE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = appTypeface
-            layoutParams = matchWrap()
-        }
-
         calCard.addView(liveEdgeRow)
-        calCard.addView(div1)
-        calCard.addView(continuousNote)
         content.addView(calCard)
 
         scroll.addView(content)
@@ -1479,10 +1467,10 @@ class MainActivity : AppCompatActivity() {
         coverArea.addView(coverContent)
 
         val footerArea = FrameLayout(this).apply {
-            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setPadding(dp(10), dp(14), dp(10), dp(14))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(58)
+                dp(70)
             )
         }
 
@@ -1534,7 +1522,9 @@ class MainActivity : AppCompatActivity() {
                 selectedLibraryId = lib.id
                 libraryManager.setActiveLibrary(lib.id)
                 refreshLibrariesPageUi()
-                if (lib.channels.isNotEmpty()) {
+                if (lib.isManualDefault && lib.channels.isEmpty()) {
+                    showAddManualUrlDialog()
+                } else if (lib.channels.isNotEmpty()) {
                     scrollToChannelsSection()
                 }
             }
@@ -1586,7 +1576,21 @@ class MainActivity : AppCompatActivity() {
         }
         coverArea.addView(iconCircle)
 
-        if (!lib.isManualDefault) {
+        if (lib.isManualDefault) {
+            val addManualBtn = FrameLayout(this).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(34), dp(34), Gravity.TOP or Gravity.END).apply {
+                    topMargin = dp(6)
+                    marginEnd = dp(6)
+                }
+                background = rippleButtonDrawable(Color.parseColor("#55000000"), Color.TRANSPARENT, dp(17).toFloat())
+                setOnClickListener { showAddManualUrlDialog() }
+                addView(
+                    VectorIconView(this@MainActivity, IconType.PLUS, Color.WHITE),
+                    FrameLayout.LayoutParams(dp(17), dp(17), Gravity.CENTER)
+                )
+            }
+            coverArea.addView(addManualBtn)
+        } else {
             val menuBtn = FrameLayout(this).apply {
                 layoutParams = FrameLayout.LayoutParams(dp(34), dp(34), Gravity.TOP or Gravity.END).apply {
                     topMargin = dp(6)
@@ -1606,10 +1610,10 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setPadding(dp(12), dp(6), dp(12), dp(8))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(58)
+                dp(70)
             )
         }
 
