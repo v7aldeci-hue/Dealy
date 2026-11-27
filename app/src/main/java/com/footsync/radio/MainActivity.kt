@@ -150,9 +150,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var librariesGridScroll: ScrollView
     private lateinit var librariesGridContainer: LinearLayout
     private lateinit var channelsSectionContainer: LinearLayout
-    private lateinit var tvChannelBrowserTitle: TextView
-    private lateinit var tvChannelBrowserCount: TextView
-    private lateinit var btnChannelBrowserManage: TextView
     private lateinit var channelsGridContainer: LinearLayout
 
     private val stateListener: (ServiceUiState) -> Unit = { state ->
@@ -166,6 +163,8 @@ class MainActivity : AppCompatActivity() {
             val svc = localBinder.getService()
             playbackService = svc
             isServiceBound = true
+            libraryManager.ensureLoadedFromDisk()
+            refreshLibrariesPageUi()
             svc.addStateListener(stateListener)
             if (pendingAutoSyncAfterPermission) {
                 pendingAutoSyncAfterPermission = false
@@ -229,14 +228,9 @@ class MainActivity : AppCompatActivity() {
         window.navigationBarColor = COLOR_HOME_BG
 
         libraryManager = LibraryManager.getInstance(applicationContext)
+        libraryManager.ensureLoadedFromDisk()
         prefs = FootSyncPrefs(this)
-        val activeLib = libraryManager.getActiveLibrary()
-        val initialLib = if (activeLib.channels.isEmpty()) {
-            libraryManager.getLibraries().firstOrNull { it.channels.isNotEmpty() } ?: activeLib
-        } else {
-            activeLib
-        }
-        selectedLibraryId = initialLib.id
+        selectedLibraryId = resolveBestSelectedLibraryId(libraryManager.getLibraries())
 
         val rootView = buildRootPagerLayout()
         applyFontRecursively(rootView)
@@ -267,12 +261,16 @@ class MainActivity : AppCompatActivity() {
             val svcIntent = Intent(this, RadioPlaybackService::class.java)
             bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
         }
+        libraryManager.ensureLoadedFromDisk()
+        refreshLibrariesPageUi()
         playbackService?.addStateListener(stateListener)
         pulseRingView.resumeAnimation()
     }
 
     override fun onResume() {
         super.onResume()
+        libraryManager.ensureLoadedFromDisk()
+        refreshLibrariesPageUi()
         AppVersionGate.check(this)
     }
 
@@ -297,7 +295,7 @@ class MainActivity : AppCompatActivity() {
             }
             isServiceBound = false
         }
-        ioExecutor.shutdownNow()
+        ioExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -1299,7 +1297,8 @@ class MainActivity : AppCompatActivity() {
         channelsSectionContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            layoutParams = matchWrap().apply { topMargin = dp(18) }
+            visibility = View.GONE
+            layoutParams = matchWrap().apply { topMargin = dp(16) }
         }
 
         val sectionDivider = View(this).apply {
@@ -1310,76 +1309,13 @@ class MainActivity : AppCompatActivity() {
             ).apply { bottomMargin = dp(14) }
         }
 
-        val browserHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = matchWrap()
-        }
-
-        val browserInfoCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-
-        tvChannelBrowserTitle = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.5f)
-            typeface = appTypefaceBold
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        tvChannelBrowserCount = TextView(this).apply {
-            setTextColor(COLOR_GRAY_SUBTITLE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = appTypeface
-            layoutParams = matchWrap().apply { topMargin = dp(2) }
-        }
-        browserInfoCol.addView(tvChannelBrowserTitle)
-        browserInfoCol.addView(tvChannelBrowserCount)
-
-        val btnAddManualInBrowser = makePillButton(
-            text = "+ رابط يدوي",
-            bgColor = Color.parseColor("#232323"),
-            textColor = COLOR_ACCENT_BLUE,
-            heightDp = 34,
-            textSizeSp = 12f
-        ).apply {
-            setPadding(dp(10), 0, dp(10), 0)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                dp(34)
-            ).apply { marginStart = dp(8) }
-            setOnClickListener { showAddManualUrlDialog() }
-        }
-
-        btnChannelBrowserManage = makePillButton(
-            text = "إدارة",
-            bgColor = Color.parseColor("#232323"),
-            textColor = COLOR_GRAY_SUBTITLE,
-            heightDp = 34,
-            textSizeSp = 12f
-        ).apply {
-            setPadding(dp(10), 0, dp(10), 0)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                dp(34)
-            ).apply { marginStart = dp(6) }
-            setOnClickListener { showManageLibraryDialog(selectedLibraryId) }
-        }
-
-        browserHeader.addView(browserInfoCol)
-        browserHeader.addView(btnAddManualInBrowser)
-        browserHeader.addView(btnChannelBrowserManage)
-
         channelsGridContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            layoutParams = matchWrap().apply { topMargin = dp(12) }
+            layoutParams = matchWrap()
         }
 
         channelsSectionContainer.addView(sectionDivider)
-        channelsSectionContainer.addView(browserHeader)
         channelsSectionContainer.addView(channelsGridContainer)
 
         unifiedContent.addView(librariesGridContainer)
@@ -1606,48 +1542,79 @@ class MainActivity : AppCompatActivity() {
             coverArea.addView(menuBtn)
         }
 
-        val infoSection = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(12), dp(6), dp(12), dp(8))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(70)
-            )
-        }
-
-        val nameView = TextView(this).apply {
-            text = lib.name
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            typeface = appTypefaceBold
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }
-
-        val countText = when (lib.channels.size) {
-            0 -> "فارغة"
-            1 -> "قناة واحدة"
-            2 -> "قناتان"
-            else -> "${lib.channels.size} قناة"
-        }
-
-        val countView = TextView(this).apply {
-            text = if (isPlayingLib) "$countText • قيد التشغيل" else countText
-            setTextColor(if (isPlayingLib || isSelected) COLOR_ACCENT_BLUE else COLOR_GRAY_SUBTITLE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            typeface = appTypeface
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            layoutParams = matchWrap().apply { topMargin = dp(2) }
-        }
-
-        infoSection.addView(nameView)
-        infoSection.addView(countView)
-
         card.addView(coverArea)
-        card.addView(infoSection)
+
+        if (lib.isManualDefault) {
+            val footerArea = FrameLayout(this).apply {
+                setPadding(dp(10), dp(14), dp(10), dp(14))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(70)
+                )
+            }
+
+            val manualBoxButton = TextView(this).apply {
+                text = "روابط يدوية"
+                setTextColor(Color.BLACK)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = appTypefaceBold
+                gravity = Gravity.CENTER
+                background = rippleButtonDrawable(
+                    fillColor = Color.WHITE,
+                    strokeColor = Color.TRANSPARENT,
+                    radiusPx = dp(10).toFloat()
+                )
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+                setOnClickListener { showAddManualUrlDialog() }
+            }
+            applySpringTouch(manualBoxButton)
+            footerArea.addView(manualBoxButton)
+            card.addView(footerArea)
+        } else {
+            val infoSection = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                setPadding(dp(12), dp(6), dp(12), dp(8))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(70)
+                )
+            }
+
+            val nameView = TextView(this).apply {
+                text = lib.name
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                typeface = appTypefaceBold
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+
+            val countText = when (lib.channels.size) {
+                0 -> "فارغة"
+                1 -> "قناة واحدة"
+                2 -> "قناتان"
+                else -> "${lib.channels.size} قناة"
+            }
+
+            val countView = TextView(this).apply {
+                text = if (isPlayingLib) "$countText • قيد التشغيل" else countText
+                setTextColor(if (isPlayingLib || isSelected) COLOR_ACCENT_BLUE else COLOR_GRAY_SUBTITLE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                typeface = appTypeface
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                layoutParams = matchWrap().apply { topMargin = dp(2) }
+            }
+
+            infoSection.addView(nameView)
+            infoSection.addView(countView)
+            card.addView(infoSection)
+        }
         return card
     }
 
@@ -2036,12 +2003,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun resolveBestSelectedLibraryId(libs: List<RadioLibrary>): String {
+        if (libs.isEmpty()) return LibraryManager.MANUAL_LIBRARY_ID
+        val currentSelected = libs.firstOrNull { it.id == selectedLibraryId }
+        if (currentSelected != null && currentSelected.channels.isNotEmpty()) {
+            return currentSelected.id
+        }
+        val playingLib = latestState.libraryId?.let { id ->
+            libs.firstOrNull { it.id == id && it.channels.isNotEmpty() }
+        }
+        if (playingLib != null) return playingLib.id
+
+        val lastPlayedLib = prefs.getLastPlayingLibraryId()?.let { id ->
+            libs.firstOrNull { it.id == id && it.channels.isNotEmpty() }
+        }
+        if (lastPlayedLib != null) return lastPlayedLib.id
+
+        val activeSavedLib = prefs.getActiveLibraryId()?.let { id ->
+            libs.firstOrNull { it.id == id && it.channels.isNotEmpty() }
+        }
+        if (activeSavedLib != null) return activeSavedLib.id
+
+        val firstNonEmpty = libs.firstOrNull { it.channels.isNotEmpty() }
+        if (firstNonEmpty != null) return firstNonEmpty.id
+
+        return currentSelected?.id ?: libs.first().id
+    }
+
     private fun refreshLibrariesPageUi() {
         val libs = libraryManager.getLibraries()
-        if (libs.none { it.id == selectedLibraryId }) {
-            selectedLibraryId = libs.firstOrNull { it.channels.isNotEmpty() }?.id
-                ?: libs.first().id
-        }
+        selectedLibraryId = resolveBestSelectedLibraryId(libs)
 
         val activeLib = libs.firstOrNull { it.id == selectedLibraryId } ?: libs.first()
         tvLibrariesSubtitle.visibility = View.VISIBLE
@@ -2105,28 +2096,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderInPageChannelGrid(lib: RadioLibrary) {
-        tvChannelBrowserTitle.text = "قنوات: ${lib.name}"
-        tvChannelBrowserCount.text =
-            "${lib.channels.size} قناة بالتسلسل • اضغط للتشغيل أو مطولاً للحذف"
-        btnChannelBrowserManage.visibility = if (lib.isManualDefault) View.GONE else View.VISIBLE
-
         channelsGridContainer.removeAllViews()
         if (lib.channels.isEmpty()) {
-            val emptyView = TextView(this).apply {
-                text = if (lib.isManualDefault) {
-                    "لا توجد روابط يدوية بعد.\nاضغط \"+ رابط يدوي\" لإضافة رابط بث مباشر."
-                } else {
-                    "هذه المكتبة فارغة."
-                }
-                setTextColor(COLOR_GRAY_SUBTITLE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-                typeface = appTypeface
-                gravity = Gravity.CENTER
-                setPadding(dp(16), dp(28), dp(16), dp(28))
-            }
-            channelsGridContainer.addView(emptyView)
+            channelsSectionContainer.visibility = View.GONE
             return
         }
+        channelsSectionContainer.visibility = View.VISIBLE
 
         val total = lib.channels.size
         var i = 0
