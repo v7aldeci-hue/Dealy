@@ -9,6 +9,8 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Outline
@@ -45,6 +47,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -123,7 +126,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var homeStatusDot: View
     private lateinit var pulseRingView: PulseRingView
     private lateinit var heroCircleButton: FrameLayout
-    private lateinit var heroEmblemView: VectorIconView
+    private lateinit var heroEmblemView: View
     private lateinit var tvHomeElapsedPill: TextView
     private lateinit var tvHomeSyncSubtext: TextView
     private lateinit var btnHomePlayPause: FrameLayout
@@ -518,8 +521,17 @@ class MainActivity : AppCompatActivity() {
         }
         applySpringTouch(heroCircleButton)
 
-        heroEmblemView = VectorIconView(this, IconType.FINGERPRINT, Color.WHITE).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(106), dp(106), Gravity.CENTER)
+        val whiteLogoBitmap = loadWhiteLogoBitmap()
+        heroEmblemView = if (whiteLogoBitmap != null) {
+            ImageView(this).apply {
+                setImageBitmap(whiteLogoBitmap)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                layoutParams = FrameLayout.LayoutParams(dp(110), dp(110), Gravity.CENTER)
+            }
+        } else {
+            VectorIconView(this, IconType.FINGERPRINT, Color.WHITE).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(106), dp(106), Gravity.CENTER)
+            }
         }
         heroCircleButton.addView(heroEmblemView)
 
@@ -748,6 +760,74 @@ class MainActivity : AppCompatActivity() {
         val fill = if (isListening) COLOR_SHAZAM_BLUE else COLOR_HERO_IDLE
         val stroke = if (isListening) Color.parseColor("#66C2E8FF") else Color.parseColor("#22FFFFFF")
         return rippleButtonDrawable(fill, stroke, dp(92).toFloat())
+    }
+
+    private fun loadWhiteLogoBitmap(): Bitmap? {
+        return try {
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeResource(resources, R.drawable.ic_app_logo, boundsOpts)
+            val maxDim = max(boundsOpts.outWidth, boundsOpts.outHeight)
+            var sample = 1
+            while (maxDim / sample > 512) {
+                sample *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val src = BitmapFactory.decodeResource(resources, R.drawable.ic_app_logo, decodeOpts)
+                ?: return null
+            val w = src.width
+            val h = src.height
+            val pixels = IntArray(w * h)
+            src.getPixels(pixels, 0, w, 0, 0, w, h)
+            src.recycle()
+
+            var minX = w
+            var minY = h
+            var maxX = -1
+            var maxY = -1
+
+            for (y in 0 until h) {
+                val rowOffset = y * w
+                for (x in 0 until w) {
+                    val idx = rowOffset + x
+                    val p = pixels[idx]
+                    val srcA = (p ushr 24) and 0xFF
+                    val r = (p shr 16) and 0xFF
+                    val g = (p shr 8) and 0xFF
+                    val b = p and 0xFF
+                    val lum = max(r, max(g, b))
+                    val rawAlpha = if (lum <= 8) 0 else (((lum - 8) * 255) / 247).coerceIn(0, 255)
+                    val alpha = (rawAlpha * srcA) / 255
+                    pixels[idx] = (alpha shl 24) or 0x00FFFFFF
+                    if (alpha > 12) {
+                        if (x < minX) minX = x
+                        if (x > maxX) maxX = x
+                        if (y < minY) minY = y
+                        if (y > maxY) maxY = y
+                    }
+                }
+            }
+
+            val full = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            full.setPixels(pixels, 0, w, 0, 0, w, h)
+
+            if (maxX > minX && maxY > minY) {
+                val pad = 2
+                val cx = (minX - pad).coerceAtLeast(0)
+                val cy = (minY - pad).coerceAtLeast(0)
+                val cw = (maxX - cx + 1 + pad).coerceAtMost(w - cx)
+                val ch = (maxY - cy + 1 + pad).coerceAtMost(h - cy)
+                val cropped = Bitmap.createBitmap(full, cx, cy, cw, ch)
+                if (cropped !== full) full.recycle()
+                cropped
+            } else {
+                full
+            }
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     // =========================================================================
